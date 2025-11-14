@@ -57,10 +57,14 @@ func main() {
 		slog.Warn("no github token provided - will use unauthenticated API calls")
 	}
 
-	// Create filesystem with logger.
+	// Create filesystem with caches.
+	// 404 cache: 1000 entries with 5 min TTL
+	// File content cache: 128 MB with 2 min TTL
 	filesys := &core.FS{
-		Client: github.NewClient(c),
-		Logger: slog.Default(),
+		Client:           github.NewClient(c),
+		Logger:           slog.Default(),
+		NotFoundCache:    core.NewNotFoundCache(1000),
+		FileContentCache: core.NewFileContentCache(128 * 1024 * 1024),
 	}
 	slog.Info("serving FUSE filesystem")
 	if err := fs.Serve(conn, filesys); err != nil {
