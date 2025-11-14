@@ -207,10 +207,18 @@ func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 		return nil, fuse.ENOENT
 	}
 
+	// Check 404 cache first
+	if r.FS.NotFoundCache.Has(req.Name) {
+		r.FS.Logger.Debug("lookup: cached 404", "user", req.Name)
+		return nil, fuse.ENOENT
+	}
+
 	r.FS.Logger.Debug("lookup: getting user", "user", req.Name)
 	u, _, err := r.FS.Client.Users.Get(ctx, req.Name)
 	if err != nil {
 		r.FS.Logger.Error("lookup: failed to get user", "user", req.Name, "error", err)
+		// Cache the 404 for 5 minutes
+		r.FS.NotFoundCache.Add(req.Name, 5*time.Minute)
 		return nil, fuse.ENOENT
 	}
 	r.FS.Logger.Debug("lookup: found user", "user", req.Name)
