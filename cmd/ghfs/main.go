@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"flag"
 	"io"
@@ -11,9 +12,7 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	"code.google.com/p/goauth2/oauth"
-	"github.com/google/go-github/github"
-	"golang.org/x/net/context"
+	"github.com/google/go-github/v60/github"
 )
 
 func main() {
@@ -32,11 +31,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer conn.Close()
 
-	// Create OAuth transport.
+	// Create HTTP client with authentication if token is provided.
 	var c *http.Client
 	if *token != "" {
-		c = (&oauth.Transport{Token: &oauth.Token{AccessToken: *token}}).Client()
+		c = &http.Client{
+			Transport: &tokenTransport{
+				token: *token,
+				base:  http.DefaultTransport,
+			},
+		}
 	}
 
 	// Create filesystem.
@@ -44,12 +49,18 @@ func main() {
 	if err := fs.Serve(conn, filesys); err != nil {
 		log.Fatal(err)
 	}
+}
 
-	// Wait until the mount is unmounted or there is an error.
-	<-conn.Ready
-	if err := conn.MountError; err != nil {
-		log.Fatal(err)
-	}
+// tokenTransport is an http.RoundTripper that adds authentication token to requests.
+type tokenTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper.
+func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Authorization", "token "+t.token)
+	return t.base.RoundTrip(req)
 }
 
 // FS represents the
@@ -66,8 +77,9 @@ type Root struct {
 	FS *FS
 }
 
-func (r *Root) Attr() fuse.Attr {
-	return fuse.Attr{Mode: os.ModeDir | 0755}
+func (r *Root) Attr(ctx context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0755
+	return nil
 }
 
 func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
@@ -75,7 +87,7 @@ func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 		return nil, fuse.ENOENT
 	}
 
-	u, _, err := r.FS.Client.Users.Get(req.Name)
+	u, _, err := r.FS.Client.Users.Get(ctx, req.Name)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
@@ -87,8 +99,9 @@ type User struct {
 	FS *FS
 }
 
-func (u *User) Attr() fuse.Attr {
-	return fuse.Attr{Mode: os.ModeDir | 0755}
+func (u *User) Attr(ctx context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0755
+	return nil
 }
 
 func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
@@ -96,7 +109,7 @@ func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 		return nil, fuse.ENOENT
 	}
 
-	r, _, err := u.FS.Client.Repositories.Get(*u.Login, req.Name)
+	r, _, err := u.FS.Client.Repositories.Get(ctx, *u.Login, req.Name)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
@@ -110,8 +123,9 @@ type Repository struct {
 
 var _ = fs.HandleReadDirAller(&Repository{})
 
-func (r *Repository) Attr() fuse.Attr {
-	return fuse.Attr{Mode: os.ModeDir | 0755}
+func (r *Repository) Attr(ctx context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0755
+	return nil
 }
 
 func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
@@ -119,7 +133,7 @@ func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *
 		return nil, fuse.ENOENT
 	}
 
-	fileContent, directoryContent, _, err := r.FS.Client.Repositories.GetContents(*r.Owner.Login, *r.Name, req.Name, nil)
+	fileContent, directoryContent, _, err := r.FS.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, req.Name, nil)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
@@ -130,7 +144,7 @@ func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *
 }
 
 func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	_, directoryContent, _, err := r.FS.Client.Repositories.GetContents(*r.Owner.Login, *r.Name, "", nil)
+	_, directoryContent, _, err := r.FS.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, "", nil)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
@@ -147,11 +161,10 @@ type File struct {
 	FS      *FS
 }
 
-func (f *File) Attr() fuse.Attr {
-	return fuse.Attr{
-		Size: uint64(*f.Content.Size),
-		Mode: 0755,
-	}
+func (f *File) Attr(ctx context.Context, attr *fuse.Attr) error {
+	attr.Size = uint64(*f.Content.Size)
+	attr.Mode = 0755
+	return nil
 }
 
 var _ = fs.NodeOpener(&File{})
@@ -179,8 +192,7 @@ type Dir struct {
 	FS       *FS
 }
 
-func (d *Dir) Attr() fuse.Attr {
-	return fuse.Attr{
-		Mode: os.ModeDir | 0755,
-	}
+func (d *Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
+	attr.Mode = os.ModeDir | 0755
+	return nil
 }
