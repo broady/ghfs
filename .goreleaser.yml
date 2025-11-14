@@ -19,11 +19,6 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-    gomod:
-      proxy: true
-      env:
-        - GOPROXY=https://proxy.golang.org,direct
-        - GOSUMDB=sum.golang.org
 
 archives:
   - format: tar.gz
