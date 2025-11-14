@@ -43,6 +43,7 @@ func main() {
 
 	// Parse arguments and require that we have the path.
 	token := flag.String("token", "", "personal access token")
+	anonymous := flag.Bool("anonymous", false, "use anonymous (unauthenticated) API requests")
 	cacheDir := flag.String("cache-dir", "", "directory for disk cache (default: ~/.cache/ghfs)")
 	memCacheMB := flag.Int("cache-mem-mb", 128, "in-memory cache size in MB")
 	diskCacheMB := flag.Int("cache-disk-mb", 1024, "disk cache size in MB")
@@ -50,6 +51,14 @@ func main() {
 	flag.Parse()
 	if flag.NArg() != 1 {
 		log.Fatal("path required")
+	}
+
+	// Require explicit authentication choice
+	if *token == "" && !*anonymous {
+		log.Fatal("must provide either -token or -anonymous flag")
+	}
+	if *token != "" && *anonymous {
+		log.Fatal("cannot specify both -token and -anonymous")
 	}
 
 	mountPath := flag.Arg(0)
@@ -119,7 +128,7 @@ func main() {
 	if *token != "" {
 		slog.Debug("github authentication enabled")
 	} else {
-		slog.Warn("no github token provided - will use unauthenticated API calls")
+		slog.Warn("using anonymous mode - API rate limits will be significantly lower (60 requests/hour)")
 	}
 
 	// Create filesystem.
