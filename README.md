@@ -9,8 +9,8 @@ Fork of [benbjohnson/ghfs](https://github.com/benbjohnson/ghfs)
 
 ## Install
 
-To use ghfs, you'll need to install [Go][go]. If you're running OS X then you'll
-also need to install [MacFUSE][macfuse].
+To use ghfs, you'll need to install [Go][go]. If you're running macOS then you'll
+also need to install [macFUSE][macfuse].
 
 To run ghfs:
 
