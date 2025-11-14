@@ -24,15 +24,14 @@ var blockedPaths = map[string]bool{
 	".cvs": true, // CVS directory
 }
 
-// GitHubHTTPTransport handles authentication, caching headers, logging, and HTTP requests.
-// It wraps httpcache.Transport to add all necessary middleware in one place.
+// GitHubHTTPTransport handles authentication and logging.
 type GitHubHTTPTransport struct {
 	Token  string // Empty if unauthenticated
 	Base   http.RoundTripper
 	Logger *slog.Logger
 }
 
-// RoundTrip implements http.RoundTripper.
+// RoundTrip implements http.RoundTripper with authentication, header normalization, and logging.
 func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Add authentication token if provided
 	if t.Token != "" {
@@ -48,24 +47,14 @@ func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return resp, err
 	}
 
-	// Add cache headers if not already present
+	// Add Cache-Control header if missing
+	// GitHub usually sends this, but we set defaults for responses that don't have it
 	if resp.Header.Get("Cache-Control") == "" {
 		if resp.StatusCode == http.StatusNotFound {
-			// Cache 404s for 5 minutes
 			resp.Header.Set("Cache-Control", "public, max-age=300")
 		} else if resp.StatusCode == http.StatusOK {
-			// Cache successful responses for 60 seconds to handle rapid re-reads
 			resp.Header.Set("Cache-Control", "public, max-age=60")
 		}
-	}
-
-	// Ensure responses have proper cache validation headers
-	if resp.Header.Get("ETag") == "" && resp.StatusCode != http.StatusNotFound {
-		// Add ETag if missing for successful responses
-		resp.Header.Set("ETag", "\""+req.URL.String()+"\"")
-	}
-	if resp.StatusCode == http.StatusNotFound && resp.Header.Get("ETag") == "" {
-		resp.Header.Set("ETag", "\"404-"+req.URL.String()+"\"")
 	}
 
 	// Ensure Date header is set (required by httpcache)
@@ -74,13 +63,16 @@ func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 
 	// Remove Vary header and related X-Varied-* headers to allow caching
-	// GitHub sends Vary which prevents httpcache from reusing responses if request headers differ
 	resp.Header.Del("Vary")
-	// Also remove any X-Varied-* headers that httpcache may have cached
 	for key := range resp.Header {
 		if strings.HasPrefix(key, "X-Varied-") {
 			resp.Header.Del(key)
 		}
+	}
+
+	// Ensure 404s have ETag for caching
+	if resp.StatusCode == http.StatusNotFound && resp.Header.Get("ETag") == "" {
+		resp.Header.Set("ETag", "\"404-"+req.URL.String()+"\"")
 	}
 
 	// Log the request with cache status
@@ -88,8 +80,15 @@ func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		cacheStatus := "miss"
 		if resp.Header.Get("X-From-Cache") == "1" {
 			cacheStatus = "hit"
+		} else if resp.StatusCode == http.StatusNotModified {
+			cacheStatus = "revalidated"
 		}
-		t.Logger.Debug("http.request", "method", req.Method, "url", req.URL.Path, "status", resp.StatusCode, "cache", cacheStatus)
+		t.Logger.Debug("http.request",
+			"method", req.Method,
+			"url", req.URL.Path,
+			"status", resp.StatusCode,
+			"cache", cacheStatus,
+		)
 	}
 
 	return resp, err
@@ -121,7 +120,6 @@ func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	var entries []fuse.Dirent
 
 	// Get the authenticated user's information
-	r.FS.Logger.Debug("root.readdir: getting authenticated user")
 	user, _, err := r.FS.Client.Users.Get(ctx, "")
 	if err != nil {
 		r.FS.Logger.Error("root.readdir: failed to get authenticated user", "error", err)
@@ -132,7 +130,6 @@ func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 	// Add the authenticated user as a directory entry
 	if user.Login != nil {
-		r.FS.Logger.Debug("root.readdir: adding authenticated user", "login", *user.Login)
 		entries = append(entries, fuse.Dirent{
 			Name: *user.Login,
 			Type: fuse.DT_Dir,
@@ -140,7 +137,6 @@ func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	}
 
 	// Get organizations the user has access to
-	r.FS.Logger.Debug("root.readdir: getting user organizations")
 	// List all organizations for the authenticated user with pagination
 	opts := &github.ListOptions{PerPage: 100}
 	for {
@@ -152,7 +148,6 @@ func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 		for _, org := range orgs {
 			if org.Login != nil {
-				r.FS.Logger.Debug("root.readdir: adding organization", "org", *org.Login)
 				entries = append(entries, fuse.Dirent{
 					Name: *org.Login,
 					Type: fuse.DT_Dir,
@@ -167,7 +162,6 @@ func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		opts.Page = resp.NextPage
 	}
 
-	r.FS.Logger.Debug("root.readdir: returning entries", "count", len(entries))
 	return entries, nil
 }
 
@@ -177,13 +171,11 @@ func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 		return nil, fuse.ENOENT
 	}
 
-	r.FS.Logger.Debug("lookup: getting user", "user", req.Name)
 	u, _, err := r.FS.Client.Users.Get(ctx, req.Name)
 	if err != nil {
 		r.FS.Logger.Error("lookup: failed to get user", "user", req.Name, "error", err)
 		return nil, fuse.ENOENT
 	}
-	r.FS.Logger.Debug("lookup: found user", "user", req.Name)
 	return &User{FS: r.FS, User: u}, nil
 }
 
@@ -202,7 +194,6 @@ func (u *User) Attr(ctx context.Context, attr *fuse.Attr) error {
 var _ = fs.HandleReadDirAller(&User{})
 
 func (u *User) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	u.FS.Logger.Debug("user.readdir: getting repositories", "user", *u.Login)
 	var entries []fuse.Dirent
 
 	// Initialize cache if needed
@@ -224,7 +215,6 @@ func (u *User) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		}
 
 		for _, repo := range repos {
-			u.FS.Logger.Debug("user.readdir: adding repository", "user", *u.Login, "repo", *repo.Name)
 			entries = append(entries, fuse.Dirent{
 				Name: *repo.Name,
 				Type: fuse.DT_Dir,
@@ -242,7 +232,6 @@ func (u *User) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		opts.Page = resp.NextPage
 	}
 
-	u.FS.Logger.Debug("user.readdir: returning entries", "user", *u.Login, "count", len(entries))
 	return entries, nil
 }
 
@@ -252,15 +241,12 @@ func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 		return nil, fuse.ENOENT
 	}
 
-	u.FS.Logger.Debug("user.lookup: getting repository", "user", *u.Login, "repo", req.Name)
-
 	// Check if we have the repository cached from a previous ReadDirAll
 	u.mu.RLock()
 	var r *github.Repository
 	if u.Repos != nil {
 		if cached, ok := u.Repos[req.Name]; ok {
 			u.mu.RUnlock()
-			u.FS.Logger.Debug("user.lookup: found repository in cache", "user", *u.Login, "repo", req.Name)
 			return &Repository{FS: u.FS, Repository: cached}, nil
 		}
 	}
@@ -272,7 +258,6 @@ func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 		u.FS.Logger.Error("user.lookup: failed to get repository", "user", *u.Login, "repo", req.Name, "error", err)
 		return nil, fuse.ENOENT
 	}
-	u.FS.Logger.Debug("user.lookup: found repository", "user", *u.Login, "repo", req.Name)
 	return &Repository{FS: u.FS, Repository: r}, nil
 }
 
@@ -303,10 +288,8 @@ func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *
 			if *content.Name == req.Name {
 				r.mu.Unlock()
 				if *content.Type == "file" {
-					r.FS.Logger.Debug("repo.lookup: found file (cached)", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 					return &File{FS: r.FS, Content: content, Owner: *r.Owner.Login, Repo: *r.Name}, nil
 				}
-				r.FS.Logger.Debug("repo.lookup: found directory (cached)", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 				return &Dir{FS: r.FS, Contents: []*github.RepositoryContent{content}, Owner: *r.Owner.Login, Repo: *r.Name}, nil
 			}
 		}
@@ -314,22 +297,18 @@ func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *
 	r.mu.Unlock()
 
 	// Cache miss - fetch from API
-	r.FS.Logger.Debug("repo.lookup: getting contents", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 	fileContent, directoryContent, _, err := r.FS.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, req.Name, nil)
 	if err != nil {
 		r.FS.Logger.Error("repo.lookup: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name, "error", err)
 		return nil, fuse.ENOENT
 	}
 	if fileContent != nil {
-		r.FS.Logger.Debug("repo.lookup: found file", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 		return &File{FS: r.FS, Content: fileContent, Owner: *r.Owner.Login, Repo: *r.Name}, nil
 	}
-	r.FS.Logger.Debug("repo.lookup: found directory", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 	return &Dir{FS: r.FS, Contents: directoryContent, Owner: *r.Owner.Login, Repo: *r.Name}, nil
 }
 
 func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	r.FS.Logger.Debug("repo.readdir: getting root directory contents", "user", *r.Owner.Login, "repo", *r.Name)
 	_, directoryContent, _, err := r.FS.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, "", nil)
 	if err != nil {
 		r.FS.Logger.Error("repo.readdir: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "error", err)
@@ -354,7 +333,6 @@ func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 			Type: dtype,
 		})
 	}
-	r.FS.Logger.Debug("repo.readdir: returning entries", "user", *r.Owner.Login, "repo", *r.Name, "count", len(entries))
 	return entries, nil
 }
 

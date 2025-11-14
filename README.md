@@ -73,6 +73,26 @@ Or use the GitHub CLI to automatically provide your token:
 $ ghfs -token $(gh auth token) ~/github.com
 ```
 
+#### Caching
+
+GHFS uses a two-tier cache by default: an in-memory LRU cache backed by a disk cache. This allows fast repeated access while persisting responses across sessions.
+
+Configure caching with the following flags:
+
+```sh
+# Default: 128 MB memory, 1 GB disk cache at ~/.cache/ghfs
+$ ghfs ~/github.com
+
+# Larger memory cache (500 MB) and disk cache (5 GB)
+$ ghfs -cache-mem-mb=500 -cache-disk-mb=5120 ~/github.com
+
+# Custom cache directory
+$ ghfs -cache-dir=/tmp/my-cache ~/github.com
+
+# Disable caching entirely
+$ ghfs -no-cache ~/github.com
+```
+
 #### Logging
 
 Control the log level using the `GHFS_LOG_LEVEL` environment variable. Valid levels are `debug`, `info`, `warn`, and `error`. Defaults to `info`.
