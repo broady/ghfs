@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -101,19 +100,6 @@ type FS struct {
 	fs.Inode
 	Client *github.Client
 	Logger *slog.Logger
-	mu     sync.Mutex
-	users  map[string]*github.User // Cache user lookups
-}
-
-var _ = (fs.NodeOnAdder)((*FS)(nil))
-
-// OnAdd is called when the inode is added to the tree
-func (f *FS) OnAdd(ctx context.Context) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.users == nil {
-		f.users = make(map[string]*github.User)
-	}
 }
 
 var _ = (fs.NodeLookuper)((*FS)(nil))
@@ -134,28 +120,11 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return existing, 0
 	}
 
-	// Check cache first
-	f.mu.Lock()
-	cachedUser, ok := f.users[name]
-	f.mu.Unlock()
-
-	var u *github.User
-	var err error
-
-	if ok {
-		u = cachedUser
-	} else {
-		// Fetch from API
-		u, _, err = f.Client.Users.Get(ctx, name)
-		if err != nil {
-			f.Logger.Error("lookup: failed to get user", "user", name, "error", err)
-			return nil, syscall.ENOENT
-		}
-
-		// Cache the user
-		f.mu.Lock()
-		f.users[name] = u
-		f.mu.Unlock()
+	// Fetch from API (httpcache will handle caching)
+	u, _, err := f.Client.Users.Get(ctx, name)
+	if err != nil {
+		f.Logger.Error("lookup: failed to get user", "user", name, "error", err)
+		return nil, syscall.ENOENT
 	}
 
 	stable := fs.StableAttr{
@@ -238,11 +207,8 @@ func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 type User struct {
 	fs.Inode
 	*github.User
-	Client        *github.Client
-	Logger        *slog.Logger
-	Repos         map[string]*github.Repository
-	mu            sync.RWMutex
-	readdirCached bool // Track if we've already done a readdir
+	Client *github.Client
+	Logger *slog.Logger
 }
 
 var _ = (fs.NodeGetattrer)((*User)(nil))
@@ -257,32 +223,9 @@ func (u *User) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 var _ = (fs.NodeReaddirer)((*User)(nil))
 
 func (u *User) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	// Check if we've already cached the repository list
-	u.mu.RLock()
-	if u.readdirCached && u.Repos != nil {
-		// Return cached results
-		var entries []fuse.DirEntry
-		for name := range u.Repos {
-			entries = append(entries, fuse.DirEntry{
-				Name: name,
-				Mode: fuse.S_IFDIR,
-			})
-		}
-		u.mu.RUnlock()
-		return fs.NewListDirStream(entries), 0
-	}
-	u.mu.RUnlock()
-
 	var entries []fuse.DirEntry
 
-	// Initialize cache if needed
-	u.mu.Lock()
-	if u.Repos == nil {
-		u.Repos = make(map[string]*github.Repository)
-	}
-	u.mu.Unlock()
-
-	// List all repositories for the user with pagination
+	// List all repositories for the user with pagination (httpcache will handle caching)
 	opts := &github.RepositoryListOptions{
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
@@ -298,10 +241,6 @@ func (u *User) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 				Name: *repo.Name,
 				Mode: fuse.S_IFDIR,
 			})
-			// Cache the repository for later lookups
-			u.mu.Lock()
-			u.Repos[*repo.Name] = repo
-			u.mu.Unlock()
 		}
 
 		if resp.NextPage == 0 {
@@ -309,11 +248,6 @@ func (u *User) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		}
 		opts.Page = resp.NextPage
 	}
-
-	// Mark as cached
-	u.mu.Lock()
-	u.readdirCached = true
-	u.mu.Unlock()
 
 	return fs.NewListDirStream(entries), 0
 }
@@ -335,23 +269,7 @@ func (u *User) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 		return existing, 0
 	}
 
-	// Check if we have the repository cached from a previous ReadDir
-	u.mu.RLock()
-	if u.Repos != nil {
-		if cached, ok := u.Repos[name]; ok {
-			u.mu.RUnlock()
-			stable := fs.StableAttr{Mode: fuse.S_IFDIR}
-			repo := &Repository{
-				Repository: cached,
-				Client:     u.Client,
-				Logger:     u.Logger,
-			}
-			return u.NewInode(ctx, repo, stable), 0
-		}
-	}
-	u.mu.RUnlock()
-
-	// Fall back to API call if not cached
+	// Fetch from API (httpcache will handle caching)
 	r, _, err := u.Client.Repositories.Get(ctx, *u.Login, name)
 	if err != nil {
 		u.Logger.Error("user.lookup: failed to get repository", "user", *u.Login, "repo", name, "error", err)
@@ -371,12 +289,8 @@ func (u *User) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 type Repository struct {
 	fs.Inode
 	*github.Repository
-	Client        *github.Client
-	Logger        *slog.Logger
-	mu            sync.Mutex
-	Contents      []*github.RepositoryContent
-	readdirCached bool         // Track if we've already done a readdir
-	readdirError  syscall.Errno // Cache readdir errors (e.g., empty repos)
+	Client *github.Client
+	Logger *slog.Logger
 }
 
 var _ = (fs.NodeGetattrer)((*Repository)(nil))
@@ -405,40 +319,7 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		return existing, 0
 	}
 
-	// Check cache first
-	r.mu.Lock()
-	if r.Contents != nil {
-		for _, content := range r.Contents {
-			if *content.Name == name {
-				r.mu.Unlock()
-				if *content.Type == "file" {
-					stable := fs.StableAttr{Mode: fuse.S_IFREG}
-					file := &File{
-						Content: content,
-						Client:  r.Client,
-						Logger:  r.Logger,
-						Owner:   *r.Owner.Login,
-						Repo:    *r.Name,
-					}
-					return r.NewInode(ctx, file, stable), 0
-				}
-				// For directories, don't initialize Contents - let Readdir fetch them lazily
-				stable := fs.StableAttr{Mode: fuse.S_IFDIR}
-				dir := &Dir{
-					Contents: nil,
-					Client:   r.Client,
-					Logger:   r.Logger,
-					Owner:    *r.Owner.Login,
-					Repo:     *r.Name,
-					Path:     *content.Path,
-				}
-				return r.NewInode(ctx, dir, stable), 0
-			}
-		}
-	}
-	r.mu.Unlock()
-
-	// Cache miss - fetch from API
+	// Fetch from API (httpcache will handle caching)
 	fileContent, directoryContent, _, err := r.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, name, nil)
 	if err != nil {
 		r.Logger.Error("repo.lookup: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "path", name, "error", err)
@@ -459,12 +340,11 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 
 	stable := fs.StableAttr{Mode: fuse.S_IFDIR}
 	dir := &Dir{
-		Contents: directoryContent,
-		Client:   r.Client,
-		Logger:   r.Logger,
-		Owner:    *r.Owner.Login,
-		Repo:     *r.Name,
-		Path:     name,
+		Client: r.Client,
+		Logger: r.Logger,
+		Owner:  *r.Owner.Login,
+		Repo:   *r.Name,
+		Path:   name,
 	}
 	return r.NewInode(ctx, dir, stable), 0
 }
@@ -472,54 +352,12 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 var _ = (fs.NodeReaddirer)((*Repository)(nil))
 
 func (r *Repository) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	// Check if we've already cached the directory contents or error
-	r.mu.Lock()
-	if r.readdirCached {
-		if r.readdirError != 0 {
-			// Return cached error (e.g., empty repository)
-			r.mu.Unlock()
-			return nil, r.readdirError
-		}
-		if r.Contents != nil {
-			// Return cached results
-			var entries []fuse.DirEntry
-			for _, f := range r.Contents {
-				var mode uint32
-				if *f.Type == "dir" {
-					mode = fuse.S_IFDIR
-				} else {
-					mode = fuse.S_IFREG
-				}
-				entries = append(entries, fuse.DirEntry{
-					Name: *f.Name,
-					Mode: mode,
-				})
-			}
-			r.mu.Unlock()
-			return fs.NewListDirStream(entries), 0
-		}
-	}
-	r.mu.Unlock()
-
-	// Fetch from API
+	// Fetch from API (httpcache will handle caching)
 	_, directoryContent, _, err := r.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, "", nil)
 	if err != nil {
-		// Cache the error to avoid repeated failed API calls
-		r.mu.Lock()
-		r.readdirCached = true
-		r.readdirError = syscall.ENOENT
-		r.mu.Unlock()
-
-		r.Logger.Debug("repo.readdir: failed to get contents (cached)", "user", *r.Owner.Login, "repo", *r.Name, "error", err)
+		r.Logger.Debug("repo.readdir: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "error", err)
 		return nil, syscall.ENOENT
 	}
-
-	// Cache the contents for use in Lookup calls and future Readdir calls
-	r.mu.Lock()
-	r.Contents = directoryContent
-	r.readdirCached = true
-	r.readdirError = 0 // No error
-	r.mu.Unlock()
 
 	var entries []fuse.DirEntry
 	for _, f := range directoryContent {
@@ -624,12 +462,11 @@ func (fh *FileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Re
 // Dir represents a directory within a GitHub repository
 type Dir struct {
 	fs.Inode
-	Contents []*github.RepositoryContent
-	Client   *github.Client
-	Logger   *slog.Logger
-	Owner    string
-	Repo     string
-	Path     string // Path within the repository (e.g., "docker" or "src/main")
+	Client *github.Client
+	Logger *slog.Logger
+	Owner  string
+	Repo   string
+	Path   string // Path within the repository (e.g., "docker" or "src/main")
 }
 
 var _ = (fs.NodeGetattrer)((*Dir)(nil))
@@ -643,18 +480,15 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 var _ = (fs.NodeReaddirer)((*Dir)(nil))
 
 func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	// Fetch contents if not already loaded
-	if d.Contents == nil {
-		_, directoryContent, _, err := d.Client.Repositories.GetContents(ctx, d.Owner, d.Repo, d.Path, nil)
-		if err != nil {
-			d.Logger.Error("dir.readdir: failed to get contents", "owner", d.Owner, "repo", d.Repo, "path", d.Path, "error", err)
-			return nil, syscall.ENOENT
-		}
-		d.Contents = directoryContent
+	// Fetch from API (httpcache will handle caching)
+	_, directoryContent, _, err := d.Client.Repositories.GetContents(ctx, d.Owner, d.Repo, d.Path, nil)
+	if err != nil {
+		d.Logger.Error("dir.readdir: failed to get contents", "owner", d.Owner, "repo", d.Repo, "path", d.Path, "error", err)
+		return nil, syscall.ENOENT
 	}
 
 	var entries []fuse.DirEntry
-	for _, content := range d.Contents {
+	for _, content := range directoryContent {
 		var mode uint32
 		if *content.Type == "dir" {
 			mode = fuse.S_IFDIR
@@ -681,32 +515,39 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		return existing, 0
 	}
 
-	for _, content := range d.Contents {
-		if *content.Name == name {
-			if *content.Type == "dir" {
-				// For directories, don't fetch contents yet - do it lazily in Readdir
-				stable := fs.StableAttr{Mode: fuse.S_IFDIR}
-				dir := &Dir{
-					Contents: nil,
-					Client:   d.Client,
-					Logger:   d.Logger,
-					Owner:    d.Owner,
-					Repo:     d.Repo,
-					Path:     *content.Path,
-				}
-				return d.NewInode(ctx, dir, stable), 0
-			} else {
-				stable := fs.StableAttr{Mode: fuse.S_IFREG}
-				file := &File{
-					Content: content,
-					Client:  d.Client,
-					Logger:  d.Logger,
-					Owner:   d.Owner,
-					Repo:    d.Repo,
-				}
-				return d.NewInode(ctx, file, stable), 0
-			}
-		}
+	// Construct the full path for this lookup
+	fullPath := d.Path + "/" + name
+
+	// Fetch from API (httpcache will handle caching)
+	fileContent, directoryContent, _, err := d.Client.Repositories.GetContents(ctx, d.Owner, d.Repo, fullPath, nil)
+	if err != nil {
+		d.Logger.Error("dir.lookup: failed to get contents", "owner", d.Owner, "repo", d.Repo, "path", fullPath, "error", err)
+		return nil, syscall.ENOENT
 	}
+
+	if fileContent != nil {
+		stable := fs.StableAttr{Mode: fuse.S_IFREG}
+		file := &File{
+			Content: fileContent,
+			Client:  d.Client,
+			Logger:  d.Logger,
+			Owner:   d.Owner,
+			Repo:    d.Repo,
+		}
+		return d.NewInode(ctx, file, stable), 0
+	}
+
+	if directoryContent != nil {
+		stable := fs.StableAttr{Mode: fuse.S_IFDIR}
+		dir := &Dir{
+			Client: d.Client,
+			Logger: d.Logger,
+			Owner:  d.Owner,
+			Repo:   d.Repo,
+			Path:   fullPath,
+		}
+		return d.NewInode(ctx, dir, stable), 0
+	}
+
 	return nil, syscall.ENOENT
 }
