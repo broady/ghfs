@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -137,12 +138,61 @@ func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 
 type User struct {
 	*github.User
-	FS *FS
+	FS    *FS
+	Repos map[string]*github.Repository
+	mu    sync.RWMutex // Protects Repos
 }
 
 func (u *User) Attr(ctx context.Context, attr *fuse.Attr) error {
 	attr.Mode = os.ModeDir | 0755
 	return nil
+}
+
+var _ = fs.HandleReadDirAller(&User{})
+
+func (u *User) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	u.FS.Logger.Debug("user.readdir: getting repositories", "user", *u.Login)
+	var entries []fuse.Dirent
+
+	// Initialize cache if needed
+	u.mu.Lock()
+	if u.Repos == nil {
+		u.Repos = make(map[string]*github.Repository)
+	}
+	u.mu.Unlock()
+
+	// List all repositories for the user with pagination
+	opts := &github.RepositoryListOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	for {
+		repos, resp, err := u.FS.Client.Repositories.List(ctx, *u.Login, opts)
+		if err != nil {
+			u.FS.Logger.Error("user.readdir: failed to get repositories", "user", *u.Login, "error", err)
+			return nil, fuse.ENOENT
+		}
+
+		for _, repo := range repos {
+			u.FS.Logger.Debug("user.readdir: adding repository", "user", *u.Login, "repo", *repo.Name)
+			entries = append(entries, fuse.Dirent{
+				Name: *repo.Name,
+				Type: fuse.DT_Dir,
+			})
+			// Cache the repository for later lookups
+			u.mu.Lock()
+			u.Repos[*repo.Name] = repo
+			u.mu.Unlock()
+		}
+
+		// Check if there are more pages
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	u.FS.Logger.Debug("user.readdir: returning entries", "user", *u.Login, "count", len(entries))
+	return entries, nil
 }
 
 func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
@@ -152,6 +202,20 @@ func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 	}
 
 	u.FS.Logger.Debug("user.lookup: getting repository", "user", *u.Login, "repo", req.Name)
+
+	// Check if we have the repository cached from a previous ReadDirAll
+	u.mu.RLock()
+	var r *github.Repository
+	if u.Repos != nil {
+		if cached, ok := u.Repos[req.Name]; ok {
+			u.mu.RUnlock()
+			u.FS.Logger.Debug("user.lookup: found repository in cache", "user", *u.Login, "repo", req.Name)
+			return &Repository{FS: u.FS, Repository: cached}, nil
+		}
+	}
+	u.mu.RUnlock()
+
+	// Fall back to API call if not cached
 	r, _, err := u.FS.Client.Repositories.Get(ctx, *u.Login, req.Name)
 	if err != nil {
 		u.FS.Logger.Error("user.lookup: failed to get repository", "user", *u.Login, "repo", req.Name, "error", err)
@@ -203,7 +267,16 @@ func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 	var entries []fuse.Dirent
 	for _, f := range directoryContent {
-		entries = append(entries, fuse.Dirent{Name: *f.Name})
+		var dtype fuse.DirentType
+		if *f.Type == "dir" {
+			dtype = fuse.DT_Dir
+		} else {
+			dtype = fuse.DT_File
+		}
+		entries = append(entries, fuse.Dirent{
+			Name: *f.Name,
+			Type: dtype,
+		})
 	}
 	r.FS.Logger.Debug("repo.readdir: returning entries", "user", *r.Owner.Login, "repo", *r.Name, "count", len(entries))
 	return entries, nil
