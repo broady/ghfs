@@ -320,7 +320,7 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	}
 
 	// Fetch from API (httpcache will handle caching)
-	fileContent, directoryContent, _, err := r.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, name, nil)
+	fileContent, _, _, err := r.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, name, nil)
 	if err != nil {
 		r.Logger.Error("repo.lookup: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "path", name, "error", err)
 		return nil, syscall.ENOENT
