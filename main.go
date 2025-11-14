@@ -17,8 +17,19 @@ import (
 
 func main() {
 	// Setup structured logging
+	logLevelStr := os.Getenv("GHFS_LOG_LEVEL")
+	if logLevelStr == "" {
+		logLevelStr = "info"
+	}
+
+	var logLevel slog.Level
+	if err := logLevel.UnmarshalText([]byte(logLevelStr)); err != nil {
+		slog.Error("invalid GHFS_LOG_LEVEL", "value", logLevelStr, "error", err)
+		logLevel = slog.LevelInfo
+	}
+
 	opts := &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+		Level: logLevel,
 	}
 	handler := slog.NewTextHandler(os.Stderr, opts)
 	logger := slog.New(handler)

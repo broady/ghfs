@@ -26,6 +26,8 @@ Now you can read data from the GitHub API via the `~/github` directory.
 
 ## Usage
 
+### Basic Usage
+
 GHFS uses GitHub URL conventions for pathing. For example, to go to a user
 you can `cd` using their username:
 
@@ -51,6 +53,34 @@ Copyright (c) 2013 Ben Johnson
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
 ...
+```
+
+### Configuration
+
+#### GitHub Authentication
+
+To authenticate with GitHub and increase API rate limits, pass your personal access token:
+
+```sh
+$ ghfs -token=YOUR_TOKEN ~/github
+```
+
+Or use the GitHub CLI to automatically provide your token:
+
+```sh
+$ ghfs -token $(gh auth token) ~/github
+```
+
+#### Logging
+
+Control the log level using the `GHFS_LOG_LEVEL` environment variable. Valid levels are `debug`, `info`, `warn`, and `error`. Defaults to `info`.
+
+```sh
+# Enable debug logging
+$ GHFS_LOG_LEVEL=debug ghfs ~/github
+
+# Suppress warnings
+$ GHFS_LOG_LEVEL=error ghfs ~/github
 ```
 
 
