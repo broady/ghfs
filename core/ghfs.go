@@ -46,16 +46,18 @@ func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return resp, err
 	}
 
-	// Override Cache-Control header to use longer cache durations
+	// Set Cache-Control header if not already present to use longer cache durations
 	// GitHub's default cache times are too short for a filesystem use case
 	// where repository contents don't change frequently
-	if resp.StatusCode == http.StatusNotFound {
-		// Cache 404s for 1 hour - if something doesn't exist, it likely won't appear soon
-		resp.Header.Set("Cache-Control", "public, max-age=3600")
-	} else if resp.StatusCode == http.StatusOK {
-		// Cache successful responses for 30 minutes
-		// This significantly reduces API calls for repository browsing
-		resp.Header.Set("Cache-Control", "public, max-age=1800")
+	if resp.Header.Get("Cache-Control") == "" {
+		if resp.StatusCode == http.StatusNotFound {
+			// Cache 404s for 1 hour - if something doesn't exist, it likely won't appear soon
+			resp.Header.Set("Cache-Control", "public, max-age=3600")
+		} else if resp.StatusCode == http.StatusOK {
+			// Cache successful responses for 30 minutes
+			// This significantly reduces API calls for repository browsing
+			resp.Header.Set("Cache-Control", "public, max-age=1800")
+		}
 	}
 
 	// Ensure Date header is set (required by httpcache)
