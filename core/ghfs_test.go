@@ -18,8 +18,8 @@ func (m *MockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return m.response, nil
 }
 
-func TestCacheHTTPTransport404Caching(t *testing.T) {
-	// Create a mock 404 response without Cache-Control headers
+func TestCacheHTTPTransport404ETagAdded(t *testing.T) {
+	// Create a mock 404 response without ETag
 	notFoundResp := &http.Response{
 		StatusCode: http.StatusNotFound,
 		Header:     make(http.Header),
@@ -33,13 +33,7 @@ func TestCacheHTTPTransport404Caching(t *testing.T) {
 	req, _ := http.NewRequest("GET", "https://api.github.com/repos/owner/repo/contents/nonexistent", nil)
 	resp, _ := cacheTransport.RoundTrip(req)
 
-	// Verify that Cache-Control header was added
-	cacheControl := resp.Header.Get("Cache-Control")
-	if cacheControl == "" {
-		t.Error("Expected Cache-Control header to be set for 404 response")
-	}
-
-	// Verify that ETag was added
+	// Verify that ETag was added for 404 responses (required for caching)
 	etag := resp.Header.Get("ETag")
 	if etag == "" {
 		t.Error("Expected ETag header to be set for 404 response")

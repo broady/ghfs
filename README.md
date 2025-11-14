@@ -93,6 +93,17 @@ $ ghfs -cache-dir=/tmp/my-cache ~/github.com
 $ ghfs -no-cache ~/github.com
 ```
 
+**Force cache refresh:**
+
+To force immediate revalidation with GitHub (for example, to see recent changes), send SIGUSR1 to the ghfs process:
+
+```sh
+# The command is shown in the startup logs, or find the PID:
+$ kill -USR1 $(pgrep ghfs)
+```
+
+This clears the revalidation suppression cache. The next filesystem operation will check GitHub for updates, even if the cached data hasn't expired yet.
+
 #### Logging
 
 Control the log level using the `GHFS_LOG_LEVEL` environment variable. Valid levels are `debug`, `info`, `warn`, and `error`. Defaults to `info`.

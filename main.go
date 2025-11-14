@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -112,13 +113,32 @@ func main() {
 		cache := twotier.New(memCache, diskCache)
 
 		// Wrap with httpcache
-		finalTransport = &httpcache.Transport{
+		httpcacheTransport := &httpcache.Transport{
 			Cache:               cache,
 			MarkCachedResponses: true,
 			Transport:           githubTransport,
 		}
 
+		// Wrap httpcache with revalidation suppressor to avoid excessive 304 requests
+		suppressor := &core.RevalidationSuppressor{
+			Base:             httpcacheTransport,
+			SuppressDuration: 5 * time.Minute,
+			Logger:           slog.Default(),
+		}
+		finalTransport = suppressor
+
+		// Set up signal handler for cache refresh (SIGUSR1)
+		// This allows users to force revalidation without restarting
+		go func() {
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGUSR1)
+			for range sigChan {
+				suppressor.ClearSuppressionCache()
+			}
+		}()
+
 		slog.Info("cache configured", "mem_mb", *memCacheMB, "disk_mb", *diskCacheMB, "cache_dir", cachePath)
+		slog.Info("send SIGUSR1 to force cache revalidation", "command", "kill -USR1 "+strconv.Itoa(os.Getpid()))
 	}
 
 	c := &http.Client{Transport: finalTransport}
@@ -142,7 +162,7 @@ func main() {
 			FsName:        "ghfs",
 			DisableXAttrs: true,
 			// Only enable FUSE protocol debugging if GHFS_FUSE_DEBUG is set
-			Debug:  os.Getenv("GHFS_FUSE_DEBUG") != "",
+			Debug:   os.Getenv("GHFS_FUSE_DEBUG") != "",
 			Options: []string{"noatime"},
 		},
 	}
