@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"log"
+	"log/slog"
 	"net/http"
+	"os"
 
 	"github.com/google/go-github/v60/github"
 	"bazil.org/fuse"
@@ -13,6 +15,14 @@ import (
 )
 
 func main() {
+	// Setup structured logging
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}
+	handler := slog.NewTextHandler(os.Stderr, opts)
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+
 	log.SetFlags(0)
 
 	// Parse arguments and require that we have the path.
@@ -21,11 +31,14 @@ func main() {
 	if flag.NArg() != 1 {
 		log.Fatal("path required")
 	}
-	log.Printf("mounting to: %s", flag.Arg(0))
+
+	mountPath := flag.Arg(0)
+	slog.Info("starting ghfs", "mount_path", mountPath)
 
 	// Create FUSE connection.
-	conn, err := fuse.Mount(flag.Arg(0))
+	conn, err := fuse.Mount(mountPath)
 	if err != nil {
+		slog.Error("failed to mount FUSE", "path", mountPath, "error", err)
 		log.Fatal(err)
 	}
 	defer conn.Close()
@@ -39,11 +52,19 @@ func main() {
 				Base:  http.DefaultTransport,
 			},
 		}
+		slog.Debug("github authentication enabled")
+	} else {
+		slog.Warn("no github token provided - will use unauthenticated API calls")
 	}
 
-	// Create filesystem.
-	filesys := &core.FS{Client: github.NewClient(c)}
+	// Create filesystem with logger.
+	filesys := &core.FS{
+		Client: github.NewClient(c),
+		Logger: slog.Default(),
+	}
+	slog.Info("serving FUSE filesystem")
 	if err := fs.Serve(conn, filesys); err != nil {
+		slog.Error("fs.Serve failed", "error", err)
 		log.Fatal(err)
 	}
 }
