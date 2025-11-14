@@ -1,26 +1,21 @@
-ghfs [![godoc](https://godoc.org/github.com/benbjohnson/ghfs?status.png)](https://godoc.org/github.com/benbjohnson/ghfs) ![Version](http://img.shields.io/badge/status-alpha-red.png)
+ghfs
 ====
 
 The GitHub Filesystem (GHFS) is a user space filesystem that overlays the
 GitHub API. It allows you to access repositories and files using standard
 Unix commands such as `ls` and `cat`.
 
+Fork of [benbjohnson/ghfs](https://github.com/benbjohnson/ghfs)
 
 ## Install
 
 To use ghfs, you'll need to install [Go][go]. If you're running OS X then you'll
-also need to install [MacFUSE][macfuse]. Then you can install ghfs by running:
+also need to install [MacFUSE][macfuse].
+
+To run ghfs:
 
 ```sh
-$ go get github.com/benbjohnson/ghfs/...
-```
-
-This will install `ghfs` into your `$GOBIN` directory. Next you'll need to
-create a directory and use `ghfs` to mount GitHub:
-
-```sh
-$ mkdir ~/github
-$ ghfs ~/github &
+$ go run github.com/broady/ghfs@latest ~/github
 ```
 
 Now you can read data from the GitHub API via the `~/github` directory.
