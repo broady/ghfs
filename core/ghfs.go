@@ -47,10 +47,7 @@ func (r *Root) Attr(ctx context.Context, attr *fuse.Attr) error {
 }
 
 func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
-	if strings.HasPrefix(req.Name, ".") {
-		return nil, fuse.ENOENT
-	}
-
+	r.FS.Logger.Debug("lookup: getting user", "user", req.Name)
 	u, _, err := r.FS.Client.Users.Get(ctx, req.Name)
 	if err != nil {
 		r.FS.Logger.Error("lookup: failed to get user", "user", req.Name, "error", err)
@@ -71,10 +68,7 @@ func (u *User) Attr(ctx context.Context, attr *fuse.Attr) error {
 }
 
 func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
-	if strings.HasPrefix(req.Name, ".") {
-		return nil, fuse.ENOENT
-	}
-
+	u.FS.Logger.Debug("user.lookup: getting repository", "user", *u.Login, "repo", req.Name)
 	r, _, err := u.FS.Client.Repositories.Get(ctx, *u.Login, req.Name)
 	if err != nil {
 		u.FS.Logger.Error("user.lookup: failed to get repository", "user", *u.Login, "repo", req.Name, "error", err)
@@ -97,10 +91,7 @@ func (r *Repository) Attr(ctx context.Context, attr *fuse.Attr) error {
 }
 
 func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
-	if strings.HasPrefix(req.Name, ".") {
-		return nil, fuse.ENOENT
-	}
-
+	r.FS.Logger.Debug("repo.lookup: getting contents", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 	fileContent, directoryContent, _, err := r.FS.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, req.Name, nil)
 	if err != nil {
 		r.FS.Logger.Error("repo.lookup: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name, "error", err)
