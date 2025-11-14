@@ -1,11 +1,9 @@
-package main
+package core
 
 import (
 	"context"
 	"encoding/base64"
-	"flag"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -15,52 +13,16 @@ import (
 	"github.com/google/go-github/v60/github"
 )
 
-func main() {
-	log.SetFlags(0)
-
-	// Parse arguments and require that we have the path.
-	token := flag.String("token", "", "personal access token")
-	flag.Parse()
-	if flag.NArg() != 1 {
-		log.Fatal("path required")
-	}
-	log.Printf("mounting to: %s", flag.Arg(0))
-
-	// Create FUSE connection.
-	conn, err := fuse.Mount(flag.Arg(0))
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer conn.Close()
-
-	// Create HTTP client with authentication if token is provided.
-	var c *http.Client
-	if *token != "" {
-		c = &http.Client{
-			Transport: &tokenTransport{
-				token: *token,
-				base:  http.DefaultTransport,
-			},
-		}
-	}
-
-	// Create filesystem.
-	filesys := &FS{Client: github.NewClient(c)}
-	if err := fs.Serve(conn, filesys); err != nil {
-		log.Fatal(err)
-	}
-}
-
 // tokenTransport is an http.RoundTripper that adds authentication token to requests.
-type tokenTransport struct {
-	token string
-	base  http.RoundTripper
+type TokenTransport struct {
+	Token string
+	Base  http.RoundTripper
 }
 
 // RoundTrip implements http.RoundTripper.
-func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", "token "+t.token)
-	return t.base.RoundTrip(req)
+func (t *TokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Authorization", "token "+t.Token)
+	return t.Base.RoundTrip(req)
 }
 
 // FS represents the
