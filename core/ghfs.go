@@ -47,14 +47,16 @@ func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return resp, err
 	}
 
-	// Add Cache-Control header if missing
-	// GitHub usually sends this, but we set defaults for responses that don't have it
-	if resp.Header.Get("Cache-Control") == "" {
-		if resp.StatusCode == http.StatusNotFound {
-			resp.Header.Set("Cache-Control", "public, max-age=300")
-		} else if resp.StatusCode == http.StatusOK {
-			resp.Header.Set("Cache-Control", "public, max-age=60")
-		}
+	// Override Cache-Control header to use longer cache durations
+	// GitHub's default cache times are too short for a filesystem use case
+	// where repository contents don't change frequently
+	if resp.StatusCode == http.StatusNotFound {
+		// Cache 404s for 1 hour - if something doesn't exist, it likely won't appear soon
+		resp.Header.Set("Cache-Control", "public, max-age=3600")
+	} else if resp.StatusCode == http.StatusOK {
+		// Cache successful responses for 30 minutes
+		// This significantly reduces API calls for repository browsing
+		resp.Header.Set("Cache-Control", "public, max-age=1800")
 	}
 
 	// Ensure Date header is set (required by httpcache)
@@ -123,8 +125,8 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return nil, syscall.ENOENT
 	}
 
-	// Set entry cache timeout to 60 seconds
-	out.SetEntryTimeout(60 * time.Second)
+	// Set entry cache timeout to 30 minutes to reduce lookups
+	out.SetEntryTimeout(30 * time.Minute)
 
 	// Check if we already have an inode for this user
 	existing := f.GetChild(name)
@@ -223,7 +225,7 @@ var _ = (fs.NodeGetattrer)((*FS)(nil))
 // Getattr returns attributes for the root directory
 func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fuse.S_IFDIR | 0755
-	out.SetTimeout(60 * time.Second)
+	out.SetTimeout(30 * time.Minute)
 	// Set reasonable timestamps to avoid unnecessary revalidation
 	now := uint64(time.Now().Unix())
 	out.Atime = now
@@ -247,7 +249,7 @@ var _ = (fs.NodeGetattrer)((*User)(nil))
 
 func (u *User) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fuse.S_IFDIR | 0755
-	out.SetTimeout(60 * time.Second)
+	out.SetTimeout(30 * time.Minute)
 	out.Nlink = 2 // . and ..
 	return 0
 }
@@ -324,8 +326,8 @@ func (u *User) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 		return nil, syscall.ENOENT
 	}
 
-	// Set entry cache timeout to 60 seconds
-	out.SetEntryTimeout(60 * time.Second)
+	// Set entry cache timeout to 30 minutes to reduce lookups
+	out.SetEntryTimeout(30 * time.Minute)
 
 	// Check if we already have an inode for this repository
 	existing := u.GetChild(name)
@@ -381,7 +383,7 @@ var _ = (fs.NodeGetattrer)((*Repository)(nil))
 
 func (r *Repository) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fuse.S_IFDIR | 0755
-	out.SetTimeout(60 * time.Second)
+	out.SetTimeout(30 * time.Minute)
 	out.Nlink = 2 // . and ..
 	return 0
 }
@@ -394,8 +396,8 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		return nil, syscall.ENOENT
 	}
 
-	// Set entry cache timeout to 60 seconds
-	out.SetEntryTimeout(60 * time.Second)
+	// Set entry cache timeout to 30 minutes to reduce lookups
+	out.SetEntryTimeout(30 * time.Minute)
 
 	// Check if we already have an inode for this entry
 	existing := r.GetChild(name)
@@ -420,13 +422,15 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 					}
 					return r.NewInode(ctx, file, stable), 0
 				}
+				// For directories, don't initialize Contents - let Readdir fetch them lazily
 				stable := fs.StableAttr{Mode: fuse.S_IFDIR}
 				dir := &Dir{
-					Contents: []*github.RepositoryContent{content},
+					Contents: nil,
 					Client:   r.Client,
 					Logger:   r.Logger,
 					Owner:    *r.Owner.Login,
 					Repo:     *r.Name,
+					Path:     *content.Path,
 				}
 				return r.NewInode(ctx, dir, stable), 0
 			}
@@ -460,6 +464,7 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		Logger:   r.Logger,
 		Owner:    *r.Owner.Login,
 		Repo:     *r.Name,
+		Path:     name,
 	}
 	return r.NewInode(ctx, dir, stable), 0
 }
@@ -547,7 +552,7 @@ var _ = (fs.NodeGetattrer)((*File)(nil))
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Size = uint64(*f.Content.Size)
 	out.Mode = fuse.S_IFREG | 0644
-	out.SetTimeout(60 * time.Second)
+	out.SetTimeout(30 * time.Minute)
 	return 0
 }
 
@@ -624,19 +629,30 @@ type Dir struct {
 	Logger   *slog.Logger
 	Owner    string
 	Repo     string
+	Path     string // Path within the repository (e.g., "docker" or "src/main")
 }
 
 var _ = (fs.NodeGetattrer)((*Dir)(nil))
 
 func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fuse.S_IFDIR | 0755
-	out.SetTimeout(60 * time.Second)
+	out.SetTimeout(30 * time.Minute)
 	return 0
 }
 
 var _ = (fs.NodeReaddirer)((*Dir)(nil))
 
 func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	// Fetch contents if not already loaded
+	if d.Contents == nil {
+		_, directoryContent, _, err := d.Client.Repositories.GetContents(ctx, d.Owner, d.Repo, d.Path, nil)
+		if err != nil {
+			d.Logger.Error("dir.readdir: failed to get contents", "owner", d.Owner, "repo", d.Repo, "path", d.Path, "error", err)
+			return nil, syscall.ENOENT
+		}
+		d.Contents = directoryContent
+	}
+
 	var entries []fuse.DirEntry
 	for _, content := range d.Contents {
 		var mode uint32
@@ -656,8 +672,8 @@ func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 var _ = (fs.NodeLookuper)((*Dir)(nil))
 
 func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	// Set entry cache timeout to 60 seconds
-	out.SetEntryTimeout(60 * time.Second)
+	// Set entry cache timeout to 30 minutes to reduce lookups
+	out.SetEntryTimeout(30 * time.Minute)
 
 	// Check if we already have an inode for this entry
 	existing := d.GetChild(name)
@@ -668,19 +684,15 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	for _, content := range d.Contents {
 		if *content.Name == name {
 			if *content.Type == "dir" {
-				// For directories, we need to fetch the contents
-				_, dirContents, _, err := d.Client.Repositories.GetContents(ctx, d.Owner, d.Repo, *content.Path, nil)
-				if err != nil {
-					d.Logger.Error("dir.lookup: failed to get directory contents", "owner", d.Owner, "repo", d.Repo, "path", *content.Path, "error", err)
-					return nil, syscall.ENOENT
-				}
+				// For directories, don't fetch contents yet - do it lazily in Readdir
 				stable := fs.StableAttr{Mode: fuse.S_IFDIR}
 				dir := &Dir{
-					Contents: dirContents,
+					Contents: nil,
 					Client:   d.Client,
 					Logger:   d.Logger,
 					Owner:    d.Owner,
 					Repo:     d.Repo,
+					Path:     *content.Path,
 				}
 				return d.NewInode(ctx, dir, stable), 0
 			} else {
