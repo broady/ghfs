@@ -9,5 +9,6 @@ require (
 
 require (
 	github.com/google/go-querystring v1.1.0 // indirect
+	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 )

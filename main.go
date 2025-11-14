@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/google/go-github/v60/github"
+	"github.com/gregjones/httpcache"
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 
@@ -43,28 +44,35 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Create HTTP client with authentication if token is provided.
+	// Create HTTP client with authentication and caching.
+	// Chain: TokenTransport -> CachingTransport -> http.DefaultTransport
 	var c *http.Client
 	if *token != "" {
+		transport := &core.TokenTransport{
+			Token: *token,
+			Base: &httpcache.Transport{
+				Cache:               httpcache.NewMemoryCache(),
+				MarkCachedResponses: true,
+			},
+			Logger: slog.Default(),
+		}
+		c = &http.Client{Transport: transport}
+		slog.Debug("github authentication and caching enabled")
+	} else {
 		c = &http.Client{
-			Transport: &core.TokenTransport{
-				Token: *token,
-				Base:  http.DefaultTransport,
+			Transport: &httpcache.Transport{
+				Cache:               httpcache.NewMemoryCache(),
+				MarkCachedResponses: true,
 			},
 		}
-		slog.Debug("github authentication enabled")
-	} else {
-		slog.Warn("no github token provided - will use unauthenticated API calls")
+		slog.Warn("no github token provided - will use unauthenticated API calls with caching")
 	}
 
-	// Create filesystem with caches.
-	// 404 cache: 1000 entries with 5 min TTL
-	// File content cache: 128 MB with 2 min TTL
+	// Create filesystem.
+	// HTTP cache: httpcache for all GitHub API responses (automatic via http.Client)
 	filesys := &core.FS{
-		Client:           github.NewClient(c),
-		Logger:           slog.Default(),
-		NotFoundCache:    core.NewNotFoundCache(1000),
-		FileContentCache: core.NewFileContentCache(128 * 1024 * 1024),
+		Client: github.NewClient(c),
+		Logger: slog.Default(),
 	}
 	slog.Info("serving FUSE filesystem")
 	if err := fs.Serve(conn, filesys); err != nil {

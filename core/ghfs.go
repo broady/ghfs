@@ -1,7 +1,6 @@
 package core
 
 import (
-	"container/list"
 	"context"
 	"encoding/base64"
 	"io"
@@ -9,8 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
-	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -25,166 +22,31 @@ var blockedPaths = map[string]bool{
 	".cvs": true, // CVS directory
 }
 
-// NotFoundCache is an LRU cache for 404 responses with TTL.
-type NotFoundCache struct {
-	mu    sync.RWMutex
-	cache map[string]time.Time // path -> expiration time
-	lru   *list.List            // for LRU eviction
-	max   int
-}
-
-// NewNotFoundCache creates a new 404 cache with max entries and TTL.
-func NewNotFoundCache(maxEntries int) *NotFoundCache {
-	return &NotFoundCache{
-		cache: make(map[string]time.Time),
-		lru:   list.New(),
-		max:   maxEntries,
-	}
-}
-
-// Has checks if a path is in the cache and not expired.
-func (c *NotFoundCache) Has(path string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	expiration, exists := c.cache[path]
-	if !exists {
-		return false
-	}
-
-	// Check if expired
-	if time.Now().After(expiration) {
-		return false
-	}
-
-	return true
-}
-
-// Add adds a path to the cache with TTL.
-func (c *NotFoundCache) Add(path string, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	expiration := time.Now().Add(ttl)
-
-	// If already in cache, just update expiration
-	if _, exists := c.cache[path]; exists {
-		c.cache[path] = expiration
-		return
-	}
-
-	// If at capacity, remove oldest
-	if len(c.cache) >= c.max {
-		if c.lru.Len() > 0 {
-			front := c.lru.Front()
-			if front != nil {
-				delete(c.cache, front.Value.(string))
-				c.lru.Remove(front)
-			}
-		}
-	}
-
-	c.cache[path] = expiration
-	c.lru.PushBack(path)
-}
-
-// FileContentCache is an LRU cache for file contents with memory bounds and TTL.
-type FileContentCache struct {
-	mu         sync.RWMutex
-	cache      map[string]*CachedFile
-	lru        *list.List // doubly-linked list of paths for LRU eviction
-	maxBytes   int64      // max size in bytes
-	usedBytes  int64      // currently used bytes
-}
-
-// CachedFile holds file content and metadata.
-type CachedFile struct {
-	content    []byte
-	expiration time.Time
-}
-
-// NewFileContentCache creates a new file content cache with max size in bytes.
-func NewFileContentCache(maxBytes int64) *FileContentCache {
-	return &FileContentCache{
-		cache:    make(map[string]*CachedFile),
-		lru:      list.New(),
-		maxBytes: maxBytes,
-	}
-}
-
-// Get retrieves a file from cache if it exists and hasn't expired.
-func (c *FileContentCache) Get(path string) ([]byte, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	file, exists := c.cache[path]
-	if !exists {
-		return nil, false
-	}
-
-	// Check if expired
-	if time.Now().After(file.expiration) {
-		return nil, false
-	}
-
-	return file.content, true
-}
-
-// Add stores file content in cache with TTL, evicting if necessary to stay within memory bounds.
-func (c *FileContentCache) Add(path string, content []byte, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	contentSize := int64(len(content))
-
-	// If already in cache, remove old entry first
-	if existing, exists := c.cache[path]; exists {
-		c.usedBytes -= int64(len(existing.content))
-		delete(c.cache, path)
-	}
-
-	// Make room if needed
-	for c.usedBytes+contentSize > c.maxBytes && c.lru.Len() > 0 {
-		front := c.lru.Front()
-		if front != nil {
-			oldPath := front.Value.(string)
-			if oldFile, ok := c.cache[oldPath]; ok {
-				c.usedBytes -= int64(len(oldFile.content))
-				delete(c.cache, oldPath)
-			}
-			c.lru.Remove(front)
-		}
-	}
-
-	// Add new entry
-	if contentSize <= c.maxBytes {
-		c.cache[path] = &CachedFile{
-			content:    content,
-			expiration: time.Now().Add(ttl),
-		}
-		c.usedBytes += contentSize
-		c.lru.PushBack(path)
-	}
-}
 
 // tokenTransport is an http.RoundTripper that adds authentication token to requests.
 type TokenTransport struct {
-	Token string
-	Base  http.RoundTripper
+	Token  string
+	Base   http.RoundTripper
+	Logger *slog.Logger
 }
 
 // RoundTrip implements http.RoundTripper.
 func (t *TokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Header.Set("Authorization", "token "+t.Token)
-	return t.Base.RoundTrip(req)
+	resp, err := t.Base.RoundTrip(req)
+
+	// Log cache hits if marked by httpcache
+	if resp != nil && resp.Header.Get("X-From-Cache") == "1" && t.Logger != nil {
+		t.Logger.Debug("http.cache: cache hit", "url", req.URL.Path)
+	}
+
+	return resp, err
 }
 
 // FS represents the FUSE filesystem
 type FS struct {
-	Client           *github.Client
-	Logger           *slog.Logger
-	NotFoundCache    *NotFoundCache
-	FileContentCache *FileContentCache
+	Client *github.Client
+	Logger *slog.Logger
 }
 
 // Root returns the root filesystem node.
@@ -201,15 +63,65 @@ func (r *Root) Attr(ctx context.Context, attr *fuse.Attr) error {
 	return nil
 }
 
+var _ = fs.HandleReadDirAller(&Root{})
+
+func (r *Root) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	var entries []fuse.Dirent
+
+	// Get the authenticated user's information
+	r.FS.Logger.Debug("root.readdir: getting authenticated user")
+	user, _, err := r.FS.Client.Users.Get(ctx, "")
+	if err != nil {
+		r.FS.Logger.Error("root.readdir: failed to get authenticated user", "error", err)
+		// If no token is provided or user can't be authenticated, return empty list
+		// This allows the filesystem to still work, just without the user/org listing
+		return entries, nil
+	}
+
+	// Add the authenticated user as a directory entry
+	if user.Login != nil {
+		r.FS.Logger.Debug("root.readdir: adding authenticated user", "login", *user.Login)
+		entries = append(entries, fuse.Dirent{
+			Name: *user.Login,
+			Type: fuse.DT_Dir,
+		})
+	}
+
+	// Get organizations the user has access to
+	r.FS.Logger.Debug("root.readdir: getting user organizations")
+	// List all organizations for the authenticated user with pagination
+	opts := &github.ListOptions{PerPage: 100}
+	for {
+		orgs, resp, err := r.FS.Client.Organizations.List(ctx, "", opts)
+		if err != nil {
+			r.FS.Logger.Error("root.readdir: failed to get organizations", "error", err)
+			break // Continue with what we have
+		}
+
+		for _, org := range orgs {
+			if org.Login != nil {
+				r.FS.Logger.Debug("root.readdir: adding organization", "org", *org.Login)
+				entries = append(entries, fuse.Dirent{
+					Name: *org.Login,
+					Type: fuse.DT_Dir,
+				})
+			}
+		}
+
+		// Check if there are more pages
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	r.FS.Logger.Debug("root.readdir: returning entries", "count", len(entries))
+	return entries, nil
+}
+
 func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
 	if blockedPaths[req.Name] {
 		r.FS.Logger.Debug("lookup: blocked path", "name", req.Name)
-		return nil, fuse.ENOENT
-	}
-
-	// Check 404 cache first
-	if r.FS.NotFoundCache.Has(req.Name) {
-		r.FS.Logger.Debug("lookup: cached 404", "user", req.Name)
 		return nil, fuse.ENOENT
 	}
 
@@ -217,8 +129,6 @@ func (r *Root) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 	u, _, err := r.FS.Client.Users.Get(ctx, req.Name)
 	if err != nil {
 		r.FS.Logger.Error("lookup: failed to get user", "user", req.Name, "error", err)
-		// Cache the 404 for 5 minutes
-		r.FS.NotFoundCache.Add(req.Name, 5*time.Minute)
 		return nil, fuse.ENOENT
 	}
 	r.FS.Logger.Debug("lookup: found user", "user", req.Name)
@@ -269,27 +179,18 @@ func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *
 		return nil, fuse.ENOENT
 	}
 
-	// Check 404 cache first
-	cacheKey := *r.Owner.Login + "/" + *r.Name + "/" + req.Name
-	if r.FS.NotFoundCache.Has(cacheKey) {
-		r.FS.Logger.Debug("repo.lookup: cached 404", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
-		return nil, fuse.ENOENT
-	}
-
 	r.FS.Logger.Debug("repo.lookup: getting contents", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 	fileContent, directoryContent, _, err := r.FS.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, req.Name, nil)
 	if err != nil {
 		r.FS.Logger.Error("repo.lookup: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name, "error", err)
-		// Cache the 404 for 5 minutes
-		r.FS.NotFoundCache.Add(cacheKey, 5*time.Minute)
 		return nil, fuse.ENOENT
 	}
 	if fileContent != nil {
 		r.FS.Logger.Debug("repo.lookup: found file", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
-		return &File{FS: r.FS, Content: fileContent}, nil
+		return &File{FS: r.FS, Content: fileContent, Owner: *r.Owner.Login, Repo: *r.Name}, nil
 	}
 	r.FS.Logger.Debug("repo.lookup: found directory", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
-	return &Dir{FS: r.FS, Contents: directoryContent}, nil
+	return &Dir{FS: r.FS, Contents: directoryContent, Owner: *r.Owner.Login, Repo: *r.Name}, nil
 }
 
 func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
@@ -311,6 +212,8 @@ func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 type File struct {
 	Content *github.RepositoryContent
 	FS      *FS
+	Owner   string
+	Repo    string
 }
 
 func (f *File) Attr(ctx context.Context, attr *fuse.Attr) error {
@@ -325,25 +228,29 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	f.FS.Logger.Debug("file.open: opening file", "path", *f.Content.Path, "size", *f.Content.Size)
 	resp.Flags |= fuse.OpenNonSeekable
 
-	// Check cache first
-	if cached, ok := f.FS.FileContentCache.Get(*f.Content.Path); ok {
-		f.FS.Logger.Debug("file.open: using cached content", "path", *f.Content.Path)
-		return &FileHandle{
-			r:      strings.NewReader(string(cached)),
-			fs:     f.FS,
-			path:   *f.Content.Path,
-		}, nil
+	// If Content is not populated (e.g., from directory listing), fetch it
+	var content string
+	if f.Content.Content == nil || *f.Content.Content == "" {
+		fileContent, _, _, err := f.FS.Client.Repositories.GetContents(ctx, f.Owner, f.Repo, *f.Content.Path, nil)
+		if err != nil {
+			f.FS.Logger.Error("file.open: failed to get file content", "path", *f.Content.Path, "error", err)
+			return nil, err
+		}
+		if fileContent == nil {
+			f.FS.Logger.Error("file.open: got nil file content", "path", *f.Content.Path)
+			return nil, fuse.EIO
+		}
+		content = *fileContent.Content
+	} else {
+		content = *f.Content.Content
 	}
 
 	// Decode base64 from GitHub API
-	decoded, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, strings.NewReader(*f.Content.Content)))
+	decoded, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, strings.NewReader(content)))
 	if err != nil {
 		f.FS.Logger.Error("file.open: base64 decode error", "path", *f.Content.Path, "error", err)
 		return nil, err
 	}
-
-	// Cache for 2 minutes
-	f.FS.FileContentCache.Add(*f.Content.Path, decoded, 2*time.Minute)
 
 	return &FileHandle{
 		r:      strings.NewReader(string(decoded)),
@@ -377,9 +284,49 @@ func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fus
 type Dir struct {
 	Contents []*github.RepositoryContent
 	FS       *FS
+	Owner    string
+	Repo     string
 }
+
+var _ = fs.HandleReadDirAller(&Dir{})
 
 func (d *Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
 	attr.Mode = os.ModeDir | 0755
 	return nil
+}
+
+func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	var entries []fuse.Dirent
+	for _, content := range d.Contents {
+		var dtype fuse.DirentType
+		if *content.Type == "dir" {
+			dtype = fuse.DT_Dir
+		} else {
+			dtype = fuse.DT_File
+		}
+		entries = append(entries, fuse.Dirent{
+			Name: *content.Name,
+			Type: dtype,
+		})
+	}
+	return entries, nil
+}
+
+func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
+	for _, content := range d.Contents {
+		if *content.Name == req.Name {
+			if *content.Type == "dir" {
+				// For directories, we need to fetch the contents
+				_, dirContents, _, err := d.FS.Client.Repositories.GetContents(ctx, d.Owner, d.Repo, *content.Path, nil)
+				if err != nil {
+					d.FS.Logger.Error("dir.lookup: failed to get directory contents", "owner", d.Owner, "repo", d.Repo, "path", *content.Path, "error", err)
+					return nil, fuse.ENOENT
+				}
+				return &Dir{FS: d.FS, Contents: dirContents, Owner: d.Owner, Repo: d.Repo}, nil
+			} else {
+				return &File{FS: d.FS, Content: content, Owner: d.Owner, Repo: d.Repo}, nil
+			}
+		}
+	}
+	return nil, fuse.ENOENT
 }
