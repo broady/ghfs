@@ -22,6 +22,15 @@ import (
 	"github.com/broady/ghfs/core"
 )
 
+var (
+	token       = flag.String("token", "", "personal access token")
+	anonymous   = flag.Bool("anonymous", false, "use anonymous (unauthenticated) API requests")
+	cacheDir    = flag.String("cache-dir", "", "directory for disk cache (default: ~/.cache/ghfs)")
+	memCacheMB  = flag.Int("cache-mem-mb", 128, "in-memory cache size in MB")
+	diskCacheMB = flag.Int("cache-disk-mb", 1024, "disk cache size in MB")
+	noCacheFlag = flag.Bool("no-cache", false, "disable caching entirely")
+)
+
 func main() {
 	// Setup structured logging
 	logLevelStr := os.Getenv("GHFS_LOG_LEVEL")
@@ -45,12 +54,6 @@ func main() {
 	log.SetFlags(0)
 
 	// Parse arguments and require that we have the path.
-	token := flag.String("token", "", "personal access token")
-	anonymous := flag.Bool("anonymous", false, "use anonymous (unauthenticated) API requests")
-	cacheDir := flag.String("cache-dir", "", "directory for disk cache (default: ~/.cache/ghfs)")
-	memCacheMB := flag.Int("cache-mem-mb", 128, "in-memory cache size in MB")
-	diskCacheMB := flag.Int("cache-disk-mb", 1024, "disk cache size in MB")
-	noCacheFlag := flag.Bool("no-cache", false, "disable caching entirely")
 	flag.Parse()
 	if flag.NArg() != 1 {
 		log.Fatal("path required")
