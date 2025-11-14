@@ -23,52 +23,47 @@ var blockedPaths = map[string]bool{
 	".cvs": true, // CVS directory
 }
 
-// CacheHTTPTransport wraps an http.RoundTripper and ensures that 404 responses are cached.
-// This prevents repeated requests to non-existent GitHub API endpoints.
-type CacheHTTPTransport struct {
-	Base http.RoundTripper
-}
-
-// RoundTrip implements http.RoundTripper.
-// It ensures 404 responses are cacheable by adding appropriate cache headers.
-func (t *CacheHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.Base.RoundTrip(req)
-	if resp == nil || err != nil {
-		return resp, err
-	}
-
-	// For 404 responses, add cache headers if not already present
-	// This ensures httpcache will cache them for 5 minutes
-	if resp.StatusCode == http.StatusNotFound {
-		// Check if cache headers already exist
-		if resp.Header.Get("Cache-Control") == "" {
-			// Add cache header: cache for 5 minutes (300 seconds)
-			resp.Header.Set("Cache-Control", "public, max-age=300")
-		}
-		// Ensure ETag is present for revalidation (GitHub APIs typically have this)
-		if resp.Header.Get("ETag") == "" {
-			resp.Header.Set("ETag", "\"404-"+req.URL.String()+"\"")
-		}
-	}
-
-	return resp, err
-}
-
-// tokenTransport is an http.RoundTripper that adds authentication token to requests.
-type TokenTransport struct {
-	Token  string
+// GitHubHTTPTransport handles authentication, caching headers, logging, and HTTP requests.
+// It wraps httpcache.Transport to add all necessary middleware in one place.
+type GitHubHTTPTransport struct {
+	Token  string // Empty if unauthenticated
 	Base   http.RoundTripper
 	Logger *slog.Logger
 }
 
 // RoundTrip implements http.RoundTripper.
-func (t *TokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", "token "+t.Token)
-	resp, err := t.Base.RoundTrip(req)
+func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Add authentication token if provided
+	if t.Token != "" {
+		req.Header.Set("Authorization", "token "+t.Token)
+	}
 
-	// Log cache hits if marked by httpcache
-	if resp != nil && resp.Header.Get("X-From-Cache") == "1" && t.Logger != nil {
-		t.Logger.Debug("http.cache: cache hit", "url", req.URL.Path)
+	// Execute the request
+	resp, err := t.Base.RoundTrip(req)
+	if resp == nil || err != nil {
+		if t.Logger != nil && err != nil {
+			t.Logger.Debug("http.request", "method", req.Method, "url", req.URL.Path, "error", err.Error())
+		}
+		return resp, err
+	}
+
+	// Ensure 404 responses are cacheable for 5 minutes
+	if resp.StatusCode == http.StatusNotFound {
+		if resp.Header.Get("Cache-Control") == "" {
+			resp.Header.Set("Cache-Control", "public, max-age=300")
+		}
+		if resp.Header.Get("ETag") == "" {
+			resp.Header.Set("ETag", "\"404-"+req.URL.String()+"\"")
+		}
+	}
+
+	// Log the request with cache status
+	if t.Logger != nil {
+		cacheStatus := "miss"
+		if resp.Header.Get("X-From-Cache") == "1" {
+			cacheStatus = "hit"
+		}
+		t.Logger.Debug("http.request", "method", req.Method, "url", req.URL.Path, "status", resp.StatusCode, "cache", cacheStatus)
 	}
 
 	return resp, err

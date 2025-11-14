@@ -55,31 +55,21 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Create HTTP client with authentication and caching.
-	// Chain: TokenTransport -> CacheHTTPTransport (ensures 404s are cached) -> httpcache.Transport -> http.DefaultTransport
-	var c *http.Client
+	// Create HTTP client with authentication, caching, and logging.
+	// GitHubHTTPTransport wraps httpcache.Transport and handles auth, cache headers, and logging.
+	transport := &core.GitHubHTTPTransport{
+		Token: *token,
+		Base: &httpcache.Transport{
+			Cache:               httpcache.NewMemoryCache(),
+			MarkCachedResponses: true,
+		},
+		Logger: slog.Default(),
+	}
+	c := &http.Client{Transport: transport}
+
 	if *token != "" {
-		transport := &core.TokenTransport{
-			Token: *token,
-			Base: &core.CacheHTTPTransport{
-				Base: &httpcache.Transport{
-					Cache:               httpcache.NewMemoryCache(),
-					MarkCachedResponses: true,
-				},
-			},
-			Logger: slog.Default(),
-		}
-		c = &http.Client{Transport: transport}
 		slog.Debug("github authentication and caching enabled")
 	} else {
-		c = &http.Client{
-			Transport: &core.CacheHTTPTransport{
-				Base: &httpcache.Transport{
-					Cache:               httpcache.NewMemoryCache(),
-					MarkCachedResponses: true,
-				},
-			},
-		}
 		slog.Warn("no github token provided - will use unauthenticated API calls with caching")
 	}
 
