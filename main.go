@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/die-net/lrucache"
 	"github.com/die-net/lrucache/twotier"
@@ -156,15 +157,53 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	// Wait for either unmount or signal
+	done := make(chan struct{})
 	go func() {
-		<-sigChan
-		slog.Info("received shutdown signal, unmounting...")
-		if err := server.Unmount(); err != nil {
-			slog.Error("failed to unmount", "error", err)
-		}
+		server.Wait()
+		close(done)
 	}()
 
-	// Wait for the filesystem to be unmounted
-	server.Wait()
-	slog.Info("filesystem unmounted")
+	// Keep trying to unmount on each signal
+	unmounting := false
+	for {
+		select {
+		case sig := <-sigChan:
+			if unmounting {
+				slog.Info("received another shutdown signal, retrying unmount...", "signal", sig)
+			} else {
+				slog.Info("received shutdown signal", "signal", sig)
+				unmounting = true
+			}
+
+			// Try to unmount with a timeout
+			unmountDone := make(chan error, 1)
+			go func() {
+				unmountDone <- server.Unmount()
+			}()
+
+			select {
+			case err := <-unmountDone:
+				if err != nil {
+					slog.Warn("unmount failed", "error", err)
+					slog.Info("press Ctrl+C again to retry, or force unmount from another terminal", "command", "umount "+mountPath)
+					// Continue waiting for next signal or done
+				} else {
+					// Unmount succeeded, wait for cleanup
+					<-done
+					slog.Info("filesystem unmounted")
+					return
+				}
+			case <-time.After(2 * time.Second):
+				slog.Warn("unmount timed out (active operations?)")
+				slog.Info("press Ctrl+C again to retry, or force unmount from another terminal", "command", "umount "+mountPath)
+				// Continue waiting for next signal or done
+			}
+
+		case <-done:
+			// Natural unmount (e.g., fusermount -u from another terminal)
+			slog.Info("filesystem unmounted")
+			return
+		}
+	}
 }
