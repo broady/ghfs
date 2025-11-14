@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -47,13 +48,38 @@ func (t *GitHubHTTPTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return resp, err
 	}
 
-	// Ensure 404 responses are cacheable for 5 minutes
-	if resp.StatusCode == http.StatusNotFound {
-		if resp.Header.Get("Cache-Control") == "" {
+	// Add cache headers if not already present
+	if resp.Header.Get("Cache-Control") == "" {
+		if resp.StatusCode == http.StatusNotFound {
+			// Cache 404s for 5 minutes
 			resp.Header.Set("Cache-Control", "public, max-age=300")
+		} else if resp.StatusCode == http.StatusOK {
+			// Cache successful responses for 60 seconds to handle rapid re-reads
+			resp.Header.Set("Cache-Control", "public, max-age=60")
 		}
-		if resp.Header.Get("ETag") == "" {
-			resp.Header.Set("ETag", "\"404-"+req.URL.String()+"\"")
+	}
+
+	// Ensure responses have proper cache validation headers
+	if resp.Header.Get("ETag") == "" && resp.StatusCode != http.StatusNotFound {
+		// Add ETag if missing for successful responses
+		resp.Header.Set("ETag", "\""+req.URL.String()+"\"")
+	}
+	if resp.StatusCode == http.StatusNotFound && resp.Header.Get("ETag") == "" {
+		resp.Header.Set("ETag", "\"404-"+req.URL.String()+"\"")
+	}
+
+	// Ensure Date header is set (required by httpcache)
+	if resp.Header.Get("Date") == "" {
+		resp.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	}
+
+	// Remove Vary header and related X-Varied-* headers to allow caching
+	// GitHub sends Vary which prevents httpcache from reusing responses if request headers differ
+	resp.Header.Del("Vary")
+	// Also remove any X-Varied-* headers that httpcache may have cached
+	for key := range resp.Header {
+		if strings.HasPrefix(key, "X-Varied-") {
+			resp.Header.Del(key)
 		}
 	}
 
@@ -252,7 +278,9 @@ func (u *User) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.L
 
 type Repository struct {
 	*github.Repository
-	FS *FS
+	FS       *FS
+	mu       sync.Mutex
+	Contents []*github.RepositoryContent // Cached directory contents
 }
 
 var _ = fs.HandleReadDirAller(&Repository{})
@@ -268,6 +296,24 @@ func (r *Repository) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *
 		return nil, fuse.ENOENT
 	}
 
+	// Check cache first
+	r.mu.Lock()
+	if r.Contents != nil {
+		for _, content := range r.Contents {
+			if *content.Name == req.Name {
+				r.mu.Unlock()
+				if *content.Type == "file" {
+					r.FS.Logger.Debug("repo.lookup: found file (cached)", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
+					return &File{FS: r.FS, Content: content, Owner: *r.Owner.Login, Repo: *r.Name}, nil
+				}
+				r.FS.Logger.Debug("repo.lookup: found directory (cached)", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
+				return &Dir{FS: r.FS, Contents: []*github.RepositoryContent{content}, Owner: *r.Owner.Login, Repo: *r.Name}, nil
+			}
+		}
+	}
+	r.mu.Unlock()
+
+	// Cache miss - fetch from API
 	r.FS.Logger.Debug("repo.lookup: getting contents", "user", *r.Owner.Login, "repo", *r.Name, "path", req.Name)
 	fileContent, directoryContent, _, err := r.FS.Client.Repositories.GetContents(ctx, *r.Owner.Login, *r.Name, req.Name, nil)
 	if err != nil {
@@ -289,6 +335,11 @@ func (r *Repository) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		r.FS.Logger.Error("repo.readdir: failed to get contents", "user", *r.Owner.Login, "repo", *r.Name, "error", err)
 		return nil, fuse.ENOENT
 	}
+
+	// Cache the contents for use in Lookup calls
+	r.mu.Lock()
+	r.Contents = directoryContent
+	r.mu.Unlock()
 
 	var entries []fuse.Dirent
 	for _, f := range directoryContent {

@@ -56,13 +56,15 @@ func main() {
 	defer conn.Close()
 
 	// Create HTTP client with authentication, caching, and logging.
-	// GitHubHTTPTransport wraps httpcache.Transport and handles auth, cache headers, and logging.
+	// Chain: GitHubHTTPTransport (auth + cache headers + logging) -> httpcache.Transport (caching) -> http.DefaultTransport
+	cacheTransport := &httpcache.Transport{
+		Cache:               httpcache.NewMemoryCache(),
+		MarkCachedResponses: true,
+		Transport:           http.DefaultTransport,
+	}
 	transport := &core.GitHubHTTPTransport{
-		Token: *token,
-		Base: &httpcache.Transport{
-			Cache:               httpcache.NewMemoryCache(),
-			MarkCachedResponses: true,
-		},
+		Token:  *token,
+		Base:   cacheTransport,
 		Logger: slog.Default(),
 	}
 	c := &http.Client{Transport: transport}

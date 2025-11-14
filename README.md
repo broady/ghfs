@@ -85,4 +85,6 @@ $ GHFS_LOG_LEVEL=debug ghfs ~/github.com
 $ GHFS_LOG_LEVEL=error ghfs ~/github.com
 ```
 
+## TODO
 
+- Handle rate limits and 429s properly.
