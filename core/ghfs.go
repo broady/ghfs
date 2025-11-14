@@ -23,6 +23,36 @@ var blockedPaths = map[string]bool{
 	".cvs": true, // CVS directory
 }
 
+// CacheHTTPTransport wraps an http.RoundTripper and ensures that 404 responses are cached.
+// This prevents repeated requests to non-existent GitHub API endpoints.
+type CacheHTTPTransport struct {
+	Base http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper.
+// It ensures 404 responses are cacheable by adding appropriate cache headers.
+func (t *CacheHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.Base.RoundTrip(req)
+	if resp == nil || err != nil {
+		return resp, err
+	}
+
+	// For 404 responses, add cache headers if not already present
+	// This ensures httpcache will cache them for 5 minutes
+	if resp.StatusCode == http.StatusNotFound {
+		// Check if cache headers already exist
+		if resp.Header.Get("Cache-Control") == "" {
+			// Add cache header: cache for 5 minutes (300 seconds)
+			resp.Header.Set("Cache-Control", "public, max-age=300")
+		}
+		// Ensure ETag is present for revalidation (GitHub APIs typically have this)
+		if resp.Header.Get("ETag") == "" {
+			resp.Header.Set("ETag", "\"404-"+req.URL.String()+"\"")
+		}
+	}
+
+	return resp, err
+}
 
 // tokenTransport is an http.RoundTripper that adds authentication token to requests.
 type TokenTransport struct {
