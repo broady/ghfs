@@ -6,15 +6,17 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/die-net/lrucache"
 	"github.com/die-net/lrucache/twotier"
 	"github.com/google/go-github/v60/github"
 	"github.com/gregjones/httpcache"
 	"github.com/gregjones/httpcache/diskcache"
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/broady/ghfs/core"
 )
@@ -63,14 +65,6 @@ func main() {
 
 	mountPath := flag.Arg(0)
 	slog.Info("starting ghfs", "mount_path", mountPath)
-
-	// Create FUSE connection.
-	conn, err := fuse.Mount(mountPath)
-	if err != nil {
-		slog.Error("failed to mount FUSE", "path", mountPath, "error", err)
-		log.Fatal(err)
-	}
-	defer conn.Close()
 
 	// Create HTTP client with layered transports.
 	//
@@ -131,15 +125,46 @@ func main() {
 		slog.Warn("using anonymous mode - API rate limits will be significantly lower (60 requests/hour)")
 	}
 
-	// Create filesystem.
-	// HTTP cache: httpcache for all GitHub API responses (automatic via http.Client)
-	filesys := &core.FS{
+	// Create filesystem root
+	root := &core.FS{
 		Client: github.NewClient(c),
 		Logger: slog.Default(),
 	}
-	slog.Info("serving FUSE filesystem")
-	if err := fs.Serve(conn, filesys); err != nil {
-		slog.Error("fs.Serve failed", "error", err)
+
+	// Mount options
+	fuseOpts := &fs.Options{
+		MountOptions: fuse.MountOptions{
+			Name:          "ghfs",
+			FsName:        "ghfs",
+			DisableXAttrs: true,
+			// Only enable FUSE protocol debugging if GHFS_FUSE_DEBUG is set
+			Debug:  os.Getenv("GHFS_FUSE_DEBUG") != "",
+			Options: []string{"noatime"},
+		},
+	}
+
+	// Mount the filesystem
+	server, err := fs.Mount(mountPath, root, fuseOpts)
+	if err != nil {
+		slog.Error("failed to mount FUSE", "path", mountPath, "error", err)
 		log.Fatal(err)
 	}
+
+	slog.Info("serving FUSE filesystem")
+
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		slog.Info("received shutdown signal, unmounting...")
+		if err := server.Unmount(); err != nil {
+			slog.Error("failed to unmount", "error", err)
+		}
+	}()
+
+	// Wait for the filesystem to be unmounted
+	server.Wait()
+	slog.Info("filesystem unmounted")
 }

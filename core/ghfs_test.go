@@ -27,7 +27,7 @@ func TestCacheHTTPTransport404Caching(t *testing.T) {
 	}
 
 	mockTransport := &MockTransport{response: notFoundResp}
-	cacheTransport := &CacheHTTPTransport{Base: mockTransport}
+	cacheTransport := &GitHubHTTPTransport{Base: mockTransport}
 
 	// Make a request
 	req, _ := http.NewRequest("GET", "https://api.github.com/repos/owner/repo/contents/nonexistent", nil)
@@ -60,7 +60,7 @@ func TestCacheHTTPTransport200NoModification(t *testing.T) {
 	}
 
 	mockTransport := &MockTransport{response: successResp}
-	cacheTransport := &CacheHTTPTransport{Base: mockTransport}
+	cacheTransport := &GitHubHTTPTransport{Base: mockTransport}
 
 	req, _ := http.NewRequest("GET", "https://api.github.com/repos/owner/repo/contents/file", nil)
 	resp, _ := cacheTransport.RoundTrip(req)
@@ -81,7 +81,7 @@ func TestCacheHTTPTransport404WithExistingCacheControl(t *testing.T) {
 	}
 
 	mockTransport := &MockTransport{response: notFoundResp}
-	cacheTransport := &CacheHTTPTransport{Base: mockTransport}
+	cacheTransport := &GitHubHTTPTransport{Base: mockTransport}
 
 	req, _ := http.NewRequest("GET", "https://api.github.com/repos/owner/repo/contents/nonexistent", nil)
 	resp, _ := cacheTransport.RoundTrip(req)
