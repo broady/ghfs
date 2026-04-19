@@ -1,88 +1,141 @@
 package core
 
 import (
-	"io"
-	"net/http"
-	"strings"
 	"testing"
 )
 
-// MockTransport is a mock http.RoundTripper for testing
-type MockTransport struct {
-	requestCount int
-	response     *http.Response
-}
-
-func (m *MockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	m.requestCount++
-	return m.response, nil
-}
-
-func TestCacheHTTPTransport404ETagAdded(t *testing.T) {
-	// Create a mock 404 response without ETag
-	notFoundResp := &http.Response{
-		StatusCode: http.StatusNotFound,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader("Not Found")),
+func TestParseRepoAndRef_PlainName(t *testing.T) {
+	t.Parallel()
+	repo, ref, err := ParseRepoAndRef("ghfs")
+	if err != nil {
+		t.Fatalf("ParseRepoAndRef: %v", err)
 	}
-
-	mockTransport := &MockTransport{response: notFoundResp}
-	cacheTransport := &GitHubHTTPTransport{Base: mockTransport}
-
-	// Make a request
-	req, _ := http.NewRequest("GET", "https://api.github.com/repos/owner/repo/contents/nonexistent", nil)
-	resp, _ := cacheTransport.RoundTrip(req)
-
-	// Verify that ETag was added for 404 responses (required for caching)
-	etag := resp.Header.Get("ETag")
-	if etag == "" {
-		t.Error("Expected ETag header to be set for 404 response")
+	if repo != "ghfs" {
+		t.Errorf("repo = %q, want %q", repo, "ghfs")
 	}
-
-	// Verify status code is still 404
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("Expected StatusNotFound (404), got %d", resp.StatusCode)
+	if ref != "" {
+		t.Errorf("ref = %q, want empty (HEAD)", ref)
 	}
 }
 
-func TestCacheHTTPTransport200NoModification(t *testing.T) {
-	// Create a mock 200 response with existing cache headers
-	successResp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Cache-Control": []string{"public, max-age=60"}},
-		Body:       io.NopCloser(strings.NewReader("OK")),
+func TestParseRepoAndRef_WithBranch(t *testing.T) {
+	t.Parallel()
+	repo, ref, err := ParseRepoAndRef("ghfs@main")
+	if err != nil {
+		t.Fatalf("ParseRepoAndRef: %v", err)
 	}
-
-	mockTransport := &MockTransport{response: successResp}
-	cacheTransport := &GitHubHTTPTransport{Base: mockTransport}
-
-	req, _ := http.NewRequest("GET", "https://api.github.com/repos/owner/repo/contents/file", nil)
-	resp, _ := cacheTransport.RoundTrip(req)
-
-	// Verify that existing Cache-Control header is not modified
-	cacheControl := resp.Header.Get("Cache-Control")
-	if cacheControl != "public, max-age=60" {
-		t.Errorf("Expected existing Cache-Control to be preserved, got %q", cacheControl)
+	if repo != "ghfs" || ref != "main" {
+		t.Errorf("got (%q, %q), want (%q, %q)", repo, ref, "ghfs", "main")
 	}
 }
 
-func TestCacheHTTPTransport404WithExistingCacheControl(t *testing.T) {
-	// Create a mock 404 response with existing Cache-Control headers
-	notFoundResp := &http.Response{
-		StatusCode: http.StatusNotFound,
-		Header:     http.Header{"Cache-Control": []string{"private, max-age=60"}},
-		Body:       io.NopCloser(strings.NewReader("Not Found")),
+func TestParseRepoAndRef_WithTag(t *testing.T) {
+	t.Parallel()
+	repo, ref, err := ParseRepoAndRef("linux@v6.1")
+	if err != nil {
+		t.Fatalf("ParseRepoAndRef: %v", err)
 	}
+	if repo != "linux" || ref != "v6.1" {
+		t.Errorf("got (%q, %q), want (%q, %q)", repo, ref, "linux", "v6.1")
+	}
+}
 
-	mockTransport := &MockTransport{response: notFoundResp}
-	cacheTransport := &GitHubHTTPTransport{Base: mockTransport}
+func TestParseRepoAndRef_WithShortSHA(t *testing.T) {
+	t.Parallel()
+	repo, ref, err := ParseRepoAndRef("go@abc1234")
+	if err != nil {
+		t.Fatalf("ParseRepoAndRef: %v", err)
+	}
+	if repo != "go" || ref != "abc1234" {
+		t.Errorf("got (%q, %q), want (%q, %q)", repo, ref, "go", "abc1234")
+	}
+}
 
-	req, _ := http.NewRequest("GET", "https://api.github.com/repos/owner/repo/contents/nonexistent", nil)
-	resp, _ := cacheTransport.RoundTrip(req)
+func TestParseRepoAndRef_EmptyName(t *testing.T) {
+	t.Parallel()
+	_, _, err := ParseRepoAndRef("")
+	if err == nil {
+		t.Fatal("expected error for empty name")
+	}
+}
 
-	// Verify that existing Cache-Control header is preserved
-	cacheControl := resp.Header.Get("Cache-Control")
-	if cacheControl != "private, max-age=60" {
-		t.Errorf("Expected existing Cache-Control to be preserved, got %q", cacheControl)
+func TestParseRepoAndRef_EmptyRef(t *testing.T) {
+	t.Parallel()
+	_, _, err := ParseRepoAndRef("ghfs@")
+	if err == nil {
+		t.Fatal("expected error for empty ref after '@'")
+	}
+}
+
+func TestParseRepoAndRef_EmptyRepo(t *testing.T) {
+	t.Parallel()
+	_, _, err := ParseRepoAndRef("@main")
+	if err == nil {
+		t.Fatal("expected error for empty repo")
+	}
+}
+
+func TestParseRepoAndRef_SlashInRef(t *testing.T) {
+	t.Parallel()
+	_, _, err := ParseRepoAndRef("ghfs@feature/x")
+	if err == nil {
+		t.Fatal("expected error for '/' in ref (FUSE can't carry slashes in entry names)")
+	}
+}
+
+func TestJoinRepoPath(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		dir, base, want string
+	}{
+		{".", "file", "file"},
+		{"", "file", "file"},
+		{"a", "b", "a/b"},
+		{"a/b", "c", "a/b/c"},
+	}
+	for _, c := range cases {
+		got := joinRepoPath(c.dir, c.base)
+		if got != c.want {
+			t.Errorf("joinRepoPath(%q, %q) = %q, want %q", c.dir, c.base, got, c.want)
+		}
+	}
+}
+
+func TestBlockedPathsCoverVCS(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{".git", ".svn", ".cvs", ".hg", ".bzr", ".jj"} {
+		if !blockedInRepo[name] {
+			t.Errorf("blockedInRepo[%q] should be true (VCS metadata must block in-repo)", name)
+		}
+		if !blockedTopLevel[name] {
+			t.Errorf("blockedTopLevel[%q] should be true (VCS metadata must block at owner level too)", name)
+		}
+	}
+}
+
+func TestBlockedTopLevelCoversDesktopProbes(t *testing.T) {
+	t.Parallel()
+	// Regression: desktop-stack probes fired at mount (see ghfs.log)
+	// should not reach the GitHub API.
+	for _, name := range []string{
+		"autorun.inf", ".xdg-volume-info", ".Trash",
+		"AACS", "BDMV", "bdmv", "VIDEO_TS",
+		".DS_Store", "System Volume Information",
+	} {
+		if !isBlockedTopLevel(name) {
+			t.Errorf("isBlockedTopLevel(%q) should be true", name)
+		}
+	}
+	// .Trash-<uid> is matched by prefix, not exact membership.
+	for _, name := range []string{".Trash-1000", ".Trash-1000-files", ".Trash-0"} {
+		if !isBlockedTopLevel(name) {
+			t.Errorf("isBlockedTopLevel(%q) should be true (per-uid trash)", name)
+		}
+	}
+	// Must NOT block things a repo could legitimately contain.
+	for _, name := range []string{"autorun.inf", "BDMV", "AACS"} {
+		if blockedInRepo[name] {
+			t.Errorf("blockedInRepo[%q] should be false (legit repo contents must pass through)", name)
+		}
 	}
 }
