@@ -151,6 +151,52 @@ type Repo struct {
 	// backoff policy.
 	cloneFailUntil time.Time
 	cloneFailErr   error
+
+	// blobSizesMu guards blobSizes.
+	blobSizesMu sync.RWMutex
+	// blobSizes backfills real byte sizes for blobs whose tree-index
+	// entry was left SizeState="unknown" by gitstore.batchResolveSizes
+	// (blobless clones run batch-check with GIT_NO_LAZY_FETCH=1, so
+	// every blob comes back "missing" and keeps SizeBytes=0). The
+	// hydrator learns the true size as a side effect of materialising
+	// the blob; File.Open / Symlink.Readlink write it here so later
+	// File.Getattr calls — including the one the kernel issues right
+	// after open when the file's AttrTimeout is zero — see the real
+	// size and stop clipping reads at the stale zero from the tree.
+	blobSizes map[string]int64 // ObjectOID -> size
+}
+
+// SetBlobSize records size as the true byte length of the blob with
+// oid. Called by the FUSE layer after the hydrator materialises a
+// blob, so subsequent stats on any path that references the same blob
+// see the real size without a full tree re-index.
+//
+// No-op on empty oid (defensive: the tree index leaves ObjectOID=""
+// for implicit directories).
+func (r *Repo) SetBlobSize(oid string, size int64) {
+	if oid == "" {
+		return
+	}
+	r.blobSizesMu.Lock()
+	if r.blobSizes == nil {
+		r.blobSizes = map[string]int64{}
+	}
+	r.blobSizes[oid] = size
+	r.blobSizesMu.Unlock()
+}
+
+// BlobSize returns a previously-recorded size for oid. ok is false
+// if SetBlobSize was never called for this oid (either never hydrated,
+// or the tree already knows the size and the FUSE layer didn't bother
+// recording it).
+func (r *Repo) BlobSize(oid string) (size int64, ok bool) {
+	if oid == "" {
+		return 0, false
+	}
+	r.blobSizesMu.RLock()
+	size, ok = r.blobSizes[oid]
+	r.blobSizesMu.RUnlock()
+	return size, ok
 }
 
 // Tree is an in-memory view of the repository at a specific commit.

@@ -14,7 +14,11 @@ import (
 	"time"
 
 	"github.com/google/go-github/v60/github"
+	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/broady/ghfs/internal/model"
+	"github.com/broady/ghfs/internal/reposrc"
 )
 
 func TestParseRepoAndRef_PlainName(t *testing.T) {
@@ -263,6 +267,217 @@ func TestRepositoryCachedRootContents_ExpiredRefetches(t *testing.T) {
 		}
 	}()
 	_, _ = r.cachedRootContents(context.Background())
+}
+
+// Regression: blobless clones run batch-check with GIT_NO_LAZY_FETCH
+// so every blob is reported "missing" and the tree index keeps
+// SizeState="unknown", SizeBytes=0. File.Getattr used to report
+// size=0 with the full entryTimeout (30min), which page-cache-clipped
+// reads to zero bytes — `cat README.md` returned empty despite the
+// hydrator fetching the blob successfully.
+//
+// The fix: when size is unknown, consult the Repo's blob-size backfill
+// (written by File.Open after EnsureHydrated) before giving up, and
+// set a 1ns attr timeout on miss so the kernel re-Getattr's instead
+// of serving the stale zero for half an hour.
+func TestFileGetattr_UnknownSizeConsultsRepoBackfillThenShortTimeout(t *testing.T) {
+	t.Parallel()
+
+	repo := &reposrc.Repo{}
+	f := &File{
+		Repo: repo,
+		Node: model.BaseNode{
+			Path:      "README.md",
+			Type:      "file",
+			Mode:      0o100644,
+			ObjectOID: "deadbeef",
+			SizeState: "unknown",
+		},
+	}
+
+	// Before backfill: size=0, attr timeout 1ns (force kernel re-Getattr).
+	var a fuse.AttrOut
+	if errno := f.Getattr(context.Background(), nil, &a); errno != 0 {
+		t.Fatalf("Getattr: %v", errno)
+	}
+	if a.Size != 0 {
+		t.Errorf("pre-backfill Size = %d, want 0", a.Size)
+	}
+	if a.Timeout() == 0 {
+		t.Error("pre-backfill Timeout = 0, bridge would apply 30min default — reads would clip to zero for 30min")
+	}
+	if a.Timeout() >= entryTimeout {
+		t.Errorf("pre-backfill Timeout = %v, want tiny so kernel re-calls Getattr", a.Timeout())
+	}
+
+	// After backfill: size is real, timeout is entryTimeout.
+	repo.SetBlobSize("deadbeef", 1234)
+	var b fuse.AttrOut
+	if errno := f.Getattr(context.Background(), nil, &b); errno != 0 {
+		t.Fatalf("Getattr (post-backfill): %v", errno)
+	}
+	if b.Size != 1234 {
+		t.Errorf("post-backfill Size = %d, want 1234", b.Size)
+	}
+	if b.Timeout() != entryTimeout {
+		t.Errorf("post-backfill Timeout = %v, want %v", b.Timeout(), entryTimeout)
+	}
+}
+
+// Symlink.Getattr mirrors File.Getattr for the unknown-size backfill
+// path. Symlinks are less critical (Readlink is idempotent regardless
+// of cached size) but `ls -l` shows the target length from Getattr
+// so we still want it to converge on the real size.
+func TestSymlinkGetattr_UnknownSizeUsesBackfillAndShortTimeout(t *testing.T) {
+	t.Parallel()
+
+	repo := &reposrc.Repo{}
+	s := &Symlink{
+		Repo: repo,
+		Node: model.BaseNode{
+			Path:      "link",
+			Type:      "symlink",
+			Mode:      0o120000,
+			ObjectOID: "beef",
+			SizeState: "unknown",
+		},
+	}
+
+	var a fuse.AttrOut
+	if errno := s.Getattr(context.Background(), nil, &a); errno != 0 {
+		t.Fatalf("Getattr: %v", errno)
+	}
+	if a.Size != 0 {
+		t.Errorf("pre-backfill Size = %d, want 0", a.Size)
+	}
+	if a.Timeout() == 0 || a.Timeout() >= entryTimeout {
+		t.Errorf("pre-backfill Timeout = %v, want tiny non-zero", a.Timeout())
+	}
+
+	repo.SetBlobSize("beef", 11)
+	var b fuse.AttrOut
+	if errno := s.Getattr(context.Background(), nil, &b); errno != 0 {
+		t.Fatalf("Getattr (post-backfill): %v", errno)
+	}
+	if b.Size != 11 {
+		t.Errorf("post-backfill Size = %d, want 11", b.Size)
+	}
+	if b.Timeout() != entryTimeout {
+		t.Errorf("post-backfill Timeout = %v, want %v", b.Timeout(), entryTimeout)
+	}
+}
+
+// Regression for the `cat README.md → empty` bug: every Lookup return
+// path must populate out.Attr via fillLookupAttr. The go-fuse bridge
+// does NOT auto-fill attrs when the parent has a NodeLookuper (see
+// bridge.go:lookup — it calls the parent's Lookup and trusts it); if
+// we leave out.Attr at the zero value, the bridge's setEntryOutTimeout
+// stamps the 30-minute mount-option AttrTimeout onto a size=0, and the
+// kernel caches that for half an hour and serves empty reads out of
+// the page cache without ever calling Read.
+//
+// This test exercises the helper directly; that's enough to pin the
+// contract, because every Lookup path funnels through it.
+func TestFillLookupAttr_PopulatesSizeAndTimeout(t *testing.T) {
+	t.Parallel()
+
+	repo := &reposrc.Repo{}
+	repo.SetBlobSize("oid-known", 1024)
+
+	cases := []struct {
+		name        string
+		embed       fs.InodeEmbedder
+		wantSize    uint64
+		wantTimeout time.Duration
+	}{
+		{
+			name: "file with tree-known size",
+			embed: &File{Repo: &reposrc.Repo{}, Node: model.BaseNode{
+				Path: "a.go", Type: "file", Mode: 0o100644,
+				ObjectOID: "x", SizeState: "known", SizeBytes: 42,
+			}},
+			wantSize: 42, wantTimeout: entryTimeout,
+		},
+		{
+			name: "file with backfilled size",
+			embed: &File{Repo: repo, Node: model.BaseNode{
+				Path: "b.go", Type: "file", Mode: 0o100644,
+				ObjectOID: "oid-known", SizeState: "unknown",
+			}},
+			wantSize: 1024, wantTimeout: entryTimeout,
+		},
+		{
+			name: "file with still-unknown size gets short timeout",
+			embed: &File{Repo: &reposrc.Repo{}, Node: model.BaseNode{
+				Path: "c.go", Type: "file", Mode: 0o100644,
+				ObjectOID: "missing", SizeState: "unknown",
+			}},
+			wantSize: 0, wantTimeout: unknownSizeAttrTimeout,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			var out fuse.EntryOut
+			fillLookupAttr(context.Background(), c.embed, &out)
+			if out.Size != c.wantSize {
+				t.Errorf("out.Size = %d, want %d — kernel would cache wrong size and clip reads", out.Size, c.wantSize)
+			}
+			if got := out.AttrTimeout(); got != c.wantTimeout {
+				t.Errorf("out.AttrTimeout = %v, want %v", got, c.wantTimeout)
+			}
+		})
+	}
+}
+
+// Safety check for the embedder that has no Getattr: fillLookupAttr
+// must be a no-op, leaving out.Attr at its zero value for the bridge
+// to fill in via setEntryOutTimeout defaults. Matters because we call
+// this from FS.Lookup / User.Lookup on User / Repository inodes, and
+// those do have Getattr — but a future embedder that doesn't
+// shouldn't crash the lookup path.
+func TestFillLookupAttr_SkipsWhenNoGetattr(t *testing.T) {
+	t.Parallel()
+	var out fuse.EntryOut
+	// naked struct implementing neither Getattr nor the full embedder
+	// interface — pass a bare InodeEmbedder by wrapping fs.Inode.
+	type bare struct{ fs.Inode }
+	fillLookupAttr(context.Background(), &bare{}, &out)
+	if out.Size != 0 {
+		t.Errorf("out.Size = %d, want 0 (no-op expected)", out.Size)
+	}
+	if out.AttrTimeout() != 0 {
+		t.Errorf("out.AttrTimeout = %v, want 0 (bridge default should take over)", out.AttrTimeout())
+	}
+}
+
+// File.Getattr for known-size nodes (the contents-API pre-clone path)
+// must still report the real size with the full entryTimeout — the
+// backfill path is purely additive and must not regress the happy path.
+func TestFileGetattr_KnownSizeUnchanged(t *testing.T) {
+	t.Parallel()
+
+	f := &File{
+		Repo: &reposrc.Repo{},
+		Node: model.BaseNode{
+			Path:      "x.txt",
+			Type:      "file",
+			Mode:      0o100644,
+			ObjectOID: "abc",
+			SizeState: "known",
+			SizeBytes: 42,
+		},
+	}
+	var a fuse.AttrOut
+	if errno := f.Getattr(context.Background(), nil, &a); errno != 0 {
+		t.Fatalf("Getattr: %v", errno)
+	}
+	if a.Size != 42 {
+		t.Errorf("Size = %d, want 42", a.Size)
+	}
+	if a.Timeout() != entryTimeout {
+		t.Errorf("Timeout = %v, want %v", a.Timeout(), entryTimeout)
+	}
 }
 
 // Negative-cache must short-circuit too. GitHub's /contents/ returns

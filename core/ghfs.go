@@ -111,6 +111,22 @@ func isBlockedTopLevel(name string) bool {
 // a subsequent natural Lookup after SIGUSR1 will re-read the tree.
 const entryTimeout = 30 * time.Minute
 
+// unknownSizeAttrTimeout is the AttrOut.SetTimeout value used when
+// File.Getattr can't report a real size (blobless clone: batch-check
+// ran with GIT_NO_LAZY_FETCH so blobs came back "missing" and the
+// tree index kept SizeBytes=0). We want the kernel to re-call
+// Getattr as soon as anyone actually opens the file — that open goes
+// through File.Open, which hydrates and then records the real size
+// via Repo.SetBlobSize, so the next Getattr reports the correct size
+// and reads are no longer clipped to zero by the page cache.
+//
+// Can't just pass 0: the go-fuse bridge interprets AttrTimeout==0 as
+// "caller didn't set one" and applies the mount-option default
+// (30min in main.go), which would serve the stale zero size for 30
+// minutes. A tiny non-zero duration survives that check; 1ns is the
+// smallest honest value.
+const unknownSizeAttrTimeout = time.Nanosecond
+
 // userReaddirTTL is how long User.Readdir reuses its last successful
 // repo listing before re-paginating Repositories.List. FUSE invokes
 // Readdir on every shell enumeration (the kernel dcache only caches
@@ -207,6 +223,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 	}
 
 	if existing := f.GetChild(name); existing != nil {
+		fillLookupAttr(ctx, existing.Operations(), out)
 		return existing, 0
 	}
 
@@ -233,6 +250,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		Repos:        f.Repos,
 		Logger:       f.Logger,
 	}
+	fillLookupAttr(ctx, user, out)
 	return f.NewInode(ctx, user, fs.StableAttr{Mode: fuse.S_IFDIR}), 0
 }
 
@@ -692,6 +710,7 @@ func (u *User) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	// returns get EntryTimeout from mount options automatically.
 
 	if existing := u.GetChild(name); existing != nil {
+		fillLookupAttr(ctx, existing.Operations(), out)
 		return existing, 0
 	}
 
@@ -705,7 +724,9 @@ func (u *User) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 		return nil, syscall.ENOENT
 	}
 
-	return u.NewInode(ctx, u.newRepository(repoName, ref), fs.StableAttr{Mode: fuse.S_IFDIR}), 0
+	repo := u.newRepository(repoName, ref)
+	fillLookupAttr(ctx, repo, out)
+	return u.NewInode(ctx, repo, fs.StableAttr{Mode: fuse.S_IFDIR}), 0
 }
 
 // newRepository builds a Repository inode for a (repo, ref) pair.
@@ -875,6 +896,7 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	// See FS.Lookup: no pre-set EntryTimeout so the bridge can
 	// negative-cache ENOENT returns (e.g. from r.tree() or lookupViaAPI).
 	if existing := r.GetChild(name); existing != nil {
+		fillLookupAttr(ctx, existing.Operations(), out)
 		return existing, 0
 	}
 	if r.Repo.IsCloned() {
@@ -882,9 +904,9 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 		if errno != 0 {
 			return nil, errno
 		}
-		return lookupAt(ctx, &r.Inode, t, r.Repo, r.Ref, r.Logger, ".", name)
+		return lookupAt(ctx, &r.Inode, t, r.Repo, r.Ref, r.Logger, ".", name, out)
 	}
-	return r.lookupViaAPI(ctx, name)
+	return r.lookupViaAPI(ctx, name, out)
 }
 
 // readdirViaAPI lists the repo root using Repositories.GetContents.
@@ -918,7 +940,7 @@ func (r *Repository) readdirViaAPI(ctx context.Context) (fs.DirStream, syscall.E
 }
 
 // lookupViaAPI resolves a single child name via the Contents API.
-func (r *Repository) lookupViaAPI(ctx context.Context, name string) (*fs.Inode, syscall.Errno) {
+func (r *Repository) lookupViaAPI(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	// Fetch the full root listing (not just `name`) so we can pre-populate
 	// siblings — cheap insurance against the shell following up with
 	// lookups for neighbours. Shares the per-inode cache with readdirViaAPI.
@@ -945,6 +967,7 @@ func (r *Repository) lookupViaAPI(ctx context.Context, name string) (*fs.Inode, 
 		return nil, syscall.ENOENT
 	}
 	if child := r.GetChild(name); child != nil {
+		fillLookupAttr(ctx, child.Operations(), out)
 		return child, 0
 	}
 	// Shouldn't happen (we just added it) but don't error on a race.
@@ -952,6 +975,7 @@ func (r *Repository) lookupViaAPI(ctx context.Context, name string) (*fs.Inode, 
 	if embed == nil {
 		return nil, syscall.ENOENT
 	}
+	fillLookupAttr(ctx, embed, out)
 	return r.NewInode(ctx, embed, fs.StableAttr{Mode: contentMode(*match.Type)}), 0
 }
 
@@ -1086,13 +1110,14 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	// See FS.Lookup: no pre-set EntryTimeout so ENOENT returns from
 	// lookupAt (tree miss) get absorbed by the kernel negative cache.
 	if existing := d.GetChild(name); existing != nil {
+		fillLookupAttr(ctx, existing.Operations(), out)
 		return existing, 0
 	}
 	t, errno := d.tree(ctx)
 	if errno != 0 {
 		return nil, errno
 	}
-	return lookupAt(ctx, &d.Inode, t, d.Repo, d.Ref, d.Logger, d.Path, name)
+	return lookupAt(ctx, &d.Inode, t, d.Repo, d.Ref, d.Logger, d.Path, name, out)
 }
 
 // readdirAt is shared by Repository.Readdir and Dir.Readdir. It builds
@@ -1120,13 +1145,51 @@ func readdirAt(ctx context.Context, parent *fs.Inode, t *reposrc.Tree, repo *rep
 }
 
 // lookupAt resolves one child name in dirPath against the tree.
-func lookupAt(ctx context.Context, parent *fs.Inode, t *reposrc.Tree, repo *reposrc.Repo, ref string, logger *slog.Logger, dirPath, name string) (*fs.Inode, syscall.Errno) {
+func lookupAt(ctx context.Context, parent *fs.Inode, t *reposrc.Tree, repo *reposrc.Repo, ref string, logger *slog.Logger, dirPath, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	childPath := joinRepoPath(dirPath, name)
 	node, ok := t.Nodes[childPath]
 	if !ok {
 		return nil, syscall.ENOENT
 	}
-	return parent.NewInode(ctx, newNodeInode(repo, ref, logger, node), fs.StableAttr{Mode: nodeMode(node)}), 0
+	embed := newNodeInode(repo, ref, logger, node)
+	fillLookupAttr(ctx, embed, out)
+	return parent.NewInode(ctx, embed, fs.StableAttr{Mode: nodeMode(node)}), 0
+}
+
+// fillLookupAttr populates out.Attr (and AttrTimeout) from child's
+// Getattr. Every Lookup handler below must call this before returning
+// a positive result — go-fuse's loopback reference implementation
+// does the same (see loopback.go: out.Attr.FromStat(&st)).
+//
+// Skipping this was the root cause of the `cat README.md → empty`
+// regression: without it, out.Attr stayed at its zero value, and the
+// bridge's setEntryOutTimeout stamped the 30-minute mount default
+// AttrTimeout onto that stale zero. The kernel cached size=0 for
+// half an hour and served empty reads straight from the page cache —
+// never calling Getattr (which already knew the right size), never
+// calling Read. Calling the child's Getattr here propagates both the
+// real size and the short 1ns AttrTimeout that File.Getattr sets when
+// the size is still pending hydration.
+//
+// Works on both InodeEmbedder (pre-creation) and *fs.Inode (existing
+// child) — callers pass child.Operations() in the latter case.
+func fillLookupAttr(ctx context.Context, child fs.InodeEmbedder, out *fuse.EntryOut) {
+	ga, ok := child.(fs.NodeGetattrer)
+	if !ok {
+		return
+	}
+	var a fuse.AttrOut
+	if errno := ga.Getattr(ctx, nil, &a); errno != 0 {
+		return
+	}
+	out.Attr = a.Attr
+	// Only propagate a non-zero timeout: the bridge interprets
+	// out.AttrTimeout()==0 as "caller didn't set one" and fills in
+	// the mount-option default via setEntryOutTimeout, which is
+	// exactly what we want for Getattr impls that leave timeout at 0.
+	if t := a.Timeout(); t > 0 {
+		out.SetAttrTimeout(t)
+	}
 }
 
 // joinRepoPath joins dir + base, producing a clean path relative to
@@ -1199,7 +1262,8 @@ type File struct {
 var _ = (fs.NodeGetattrer)((*File)(nil))
 
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	out.Size = uint64(f.Node.SizeBytes)
+	size, known := f.resolveSize()
+	out.Size = uint64(size)
 	// 0o100644 / 0o100755 preserved via Mode; fall back to 0644 if git
 	// mode isn't something we recognise.
 	mode := uint32(0o644)
@@ -1207,8 +1271,31 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 		mode = 0o755
 	}
 	out.Mode = fuse.S_IFREG | mode
-	out.SetTimeout(entryTimeout)
+	if known {
+		out.SetTimeout(entryTimeout)
+	} else {
+		// See unknownSizeAttrTimeout: force the kernel back into
+		// Getattr ASAP so it picks up the post-Open backfill rather
+		// than serving a 30-minute-cached zero.
+		out.SetTimeout(unknownSizeAttrTimeout)
+	}
 	return 0
+}
+
+// resolveSize returns the best size we have for this file's blob: the
+// tree-reported size when known, else a hydrator-backfilled size if
+// any File.Open / Symlink.Readlink has already materialised the blob
+// this session. known=false means callers should treat the returned
+// size as a placeholder and shorten their attr timeouts so the kernel
+// re-asks after the blob lands in the cache.
+func (f *File) resolveSize() (int64, bool) {
+	if f.Node.SizeState == "known" {
+		return f.Node.SizeBytes, true
+	}
+	if sz, ok := f.Repo.BlobSize(f.Node.ObjectOID); ok {
+		return sz, true
+	}
+	return 0, false
 }
 
 var _ = (fs.NodeOpener)((*File)(nil))
@@ -1232,6 +1319,11 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		f.Logger.Error("file.open: EnsureHydrated failed", "path", f.Node.Path, "oid", f.Node.ObjectOID, "error", err)
 		return nil, 0, syscall.EIO
 	}
+	// Backfill the real size so the kernel's immediate-post-Open
+	// Getattr (short-circuited by unknownSizeAttrTimeout above) reports
+	// the true byte count. Without this, reads clip to the stale zero
+	// from the blobless-clone tree index and `cat` returns empty.
+	f.Repo.SetBlobSize(f.Node.ObjectOID, size)
 	file, err := os.Open(cachePath)
 	if err != nil {
 		f.Logger.Error("file.open: cache open failed", "path", cachePath, "error", err)
@@ -1297,9 +1389,29 @@ var _ = (fs.NodeGetattrer)((*Symlink)(nil))
 
 func (s *Symlink) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fuse.S_IFLNK | 0o777
-	out.Size = uint64(s.Node.SizeBytes)
-	out.SetTimeout(entryTimeout)
+	size, known := s.resolveSize()
+	out.Size = uint64(size)
+	if known {
+		out.SetTimeout(entryTimeout)
+	} else {
+		// Symlinks matter less than regular files here — the kernel
+		// resolves them via Readlink, which re-runs regardless of
+		// cached size — but keep the attr-timeout behaviour identical
+		// so `ls -l` eventually reports the real target length.
+		out.SetTimeout(unknownSizeAttrTimeout)
+	}
 	return 0
+}
+
+// resolveSize mirrors File.resolveSize for Symlink.
+func (s *Symlink) resolveSize() (int64, bool) {
+	if s.Node.SizeState == "known" {
+		return s.Node.SizeBytes, true
+	}
+	if sz, ok := s.Repo.BlobSize(s.Node.ObjectOID); ok {
+		return sz, true
+	}
+	return 0, false
 }
 
 var _ = (fs.NodeReadlinker)((*Symlink)(nil))
@@ -1309,11 +1421,15 @@ func (s *Symlink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	if errno != 0 {
 		return nil, errno
 	}
-	cachePath, _, err := hyd.EnsureHydrated(ctx, s.Repo.Config, s.Node)
+	cachePath, size, err := hyd.EnsureHydrated(ctx, s.Repo.Config, s.Node)
 	if err != nil {
 		s.Logger.Error("symlink.readlink: EnsureHydrated failed", "path", s.Node.Path, "error", err)
 		return nil, syscall.EIO
 	}
+	// Same backfill as File.Open: once we've materialised the blob we
+	// know its real size; record it so subsequent Getattr calls report
+	// it correctly.
+	s.Repo.SetBlobSize(s.Node.ObjectOID, size)
 	f, err := os.Open(cachePath)
 	if err != nil {
 		return nil, syscall.EIO

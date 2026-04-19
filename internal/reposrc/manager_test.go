@@ -224,6 +224,38 @@ type errTest string
 
 func (e errTest) Error() string { return string(e) }
 
+// TestRepoBlobSize covers the oid->size backfill used by the FUSE
+// layer when a blobless clone left tree entries at SizeState="unknown".
+func TestRepoBlobSize(t *testing.T) {
+	t.Parallel()
+	r := &Repo{}
+
+	if _, ok := r.BlobSize("abc"); ok {
+		t.Fatal("BlobSize on empty repo should miss")
+	}
+	// Defensive: empty oid must not allocate the map or record.
+	r.SetBlobSize("", 42)
+	if _, ok := r.BlobSize(""); ok {
+		t.Fatal("BlobSize('') should always miss")
+	}
+	if r.blobSizes != nil {
+		t.Fatal("SetBlobSize('') should not allocate the map")
+	}
+
+	r.SetBlobSize("abc", 12)
+	if sz, ok := r.BlobSize("abc"); !ok || sz != 12 {
+		t.Fatalf("BlobSize(abc) = (%d, %v), want (12, true)", sz, ok)
+	}
+	// Overwrite: the second write wins (matches artifact-fs
+	// snapshot.UpdateSize: last-write-wins is fine because the blob
+	// OID is content-addressed, so a second hydrate that reports a
+	// different size would itself be a bug).
+	r.SetBlobSize("abc", 99)
+	if sz, _ := r.BlobSize("abc"); sz != 99 {
+		t.Fatalf("BlobSize(abc) after overwrite = %d, want 99", sz)
+	}
+}
+
 // helpers
 
 func run(t *testing.T, name string, args ...string) {
