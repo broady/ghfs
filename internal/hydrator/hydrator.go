@@ -1,13 +1,15 @@
-// Package hydrator turns a priority-queued stream of HydrationTasks into
-// materialised blobs in a content-addressed cache. Multiple concurrent
-// readers requesting the same OID are coalesced onto a single fetch.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Lifted near-verbatim from github.com/cloudflare/artifact-fs/internal/hydrator.
-// Differences from the upstream:
+// Derived from github.com/cloudflare/artifact-fs/internal/hydrator.
+// Modified for use in ghfs. Notable changes:
 //   - cachePathFor shards by oid[:2] so the shared ghfs cache stays
 //     navigable (256 top-level dirs).
 //   - The upstream sibling-based overlay hooks are absent; ghfs is
 //     read-only.
+
+// Package hydrator turns a priority-queued stream of HydrationTasks into
+// materialised blobs in a content-addressed cache. Multiple concurrent
+// readers requesting the same OID are coalesced onto a single fetch.
 package hydrator
 
 import (

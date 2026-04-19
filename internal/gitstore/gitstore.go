@@ -1,8 +1,7 @@
-// Package gitstore wraps the git CLI to clone / fetch / tree-walk a
-// blobless clone and stream blob content into a per-OID cache file.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Lifted near-verbatim from github.com/cloudflare/artifact-fs/internal/gitstore.
-// Differences from the upstream:
+// Derived from github.com/cloudflare/artifact-fs/internal/gitstore.
+// Modified for use in ghfs. Notable changes:
 //   - CloneBlobless uses --no-single-branch so tags and all remote branches
 //     are reachable for "<repo>@<ref>" syntax.
 //   - ResolveRef resolves a branch, tag, or commit SHA, lazily fetching on
@@ -10,6 +9,9 @@
 //     work).
 //   - Some artifact-fs-specific methods (ComputeAheadBehind, CommitTimestamp,
 //     ReadTreeHEAD) were dropped — ghfs is read-only.
+
+// Package gitstore wraps the git CLI to clone / fetch / tree-walk a
+// blobless clone and stream blob content into a per-OID cache file.
 package gitstore
 
 import (

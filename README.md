@@ -5,7 +5,7 @@ The GitHub Filesystem (GHFS) is a user space filesystem that overlays the
 GitHub API. It allows you to access repositories and files using standard
 Unix commands such as `ls` and `cat`.
 
-Fork of [benbjohnson/ghfs](https://github.com/benbjohnson/ghfs)
+Fork of [benbjohnson/ghfs](https://github.com/benbjohnson/ghfs).
 
 ## Install
 
@@ -119,3 +119,9 @@ $ GHFS_LOG_LEVEL=error ghfs ~/github.com
 ## TODO
 
 - Handle rate limits and 429s properly.
+
+## License
+
+ghfs is distributed under the [MIT License](LICENSE), with the following exceptions:
+
+- `internal/gitstore/`, `internal/hydrator/`, `internal/auth/redact.go`, and `internal/model/types.go` are derived from [cloudflare/artifact-fs](https://github.com/cloudflare/artifact-fs) and are licensed under the [Apache License, Version 2.0](LICENSE-APACHE). Individual files carry `SPDX-License-Identifier: Apache-2.0` headers. Thank you to the Cloudflare authors.

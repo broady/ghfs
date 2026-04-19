@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Taken verbatim from github.com/cloudflare/artifact-fs/internal/hydrator.
+
 // Inflight deduplicates multiple callers waiting on the same key. Used
 // to coalesce FUSE readers that all want the same OID hydrated.
-//
-// Lifted verbatim from github.com/cloudflare/artifact-fs/internal/hydrator.
 package hydrator
 
 type inflight[T any] map[string][]chan T

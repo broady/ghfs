@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Derived from github.com/cloudflare/artifact-fs/internal/auth.
+// Modified for use in ghfs.
+
 // Package auth provides helpers for redacting credentials from strings
 // before they are logged or returned in error messages.
-//
-// Lifted near-verbatim from github.com/cloudflare/artifact-fs/internal/auth.
 package auth
 
 import (

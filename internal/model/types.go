@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Derived from github.com/cloudflare/artifact-fs. A small subset of the
+// upstream types, modified for use in ghfs (read-only, git-backed).
+
 // Package model defines the in-memory types shared between the gitstore,
 // hydrator, reposrc, and core FUSE layers.
-//
-// These types are a small subset of the types carried by
-// github.com/cloudflare/artifact-fs — enough for the read-only git-backed
-// filesystem that ghfs provides.
 package model
 
 import "time"
