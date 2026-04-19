@@ -157,10 +157,10 @@ const userPrefetchConcurrency = 16
 // want to kick the concurrent prefetch once per window.
 const userPrefetchSuppressDur = 30 * time.Second
 
-// userPrefetchTimeout caps a single prefetch run. The run can't
-// inherit the Readdir context (that cancels as soon as Readdir
-// returns, killing every in-flight prefetch) so we use a detached
-// context bounded by this.
+// userPrefetchTimeout caps a single prefetch run. Both sync and async
+// paths detach from the Readdir ctx (which cancels aggressively on
+// client disconnect / tab-completion cycling) and bound themselves
+// with this timeout instead.
 const userPrefetchTimeout = 30 * time.Second
 
 // FS is the filesystem root — one dir per GitHub user/org. It owns no
@@ -321,12 +321,18 @@ type User struct {
 	// absence from knownRepos is authoritative ENOENT without an API hit.
 	readdirDone bool
 
-	// dirMu guards dirNames + dirCachedAt. Separate from knownMu
-	// because Readdir's cache hit path only needs the ordered names
+	// dirMu guards dirListings + dirCachedAt. Separate from knownMu
+	// because Readdir's cache hit path only needs the ordered listing
 	// slice, not the membership map.
-	dirMu       sync.Mutex
-	dirNames    []string  // last successful listing, in API order
-	dirCachedAt time.Time // zero value = no cache yet
+	//
+	// We cache the full repoListing (not just names) so the cache-hit
+	// buildEntries path also has pushedAt available — otherwise a
+	// warm-names / cold-children path (e.g. a stale kernel dcache
+	// flushed but the User dirNames still fresh) would temporarily
+	// report zero mtime on newly-created child inodes.
+	dirMu        sync.Mutex
+	dirListings  []repoListing // last successful listing, in API order
+	dirCachedAt  time.Time     // zero value = no cache yet
 
 	// prefetchMu guards prefetchStartedAt — debounces
 	// startPrefetchRepoContents so a rapid sequence of User.Readdir
@@ -367,36 +373,38 @@ var _ = (fs.NodeReaddirer)((*User)(nil))
 func (u *User) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	started := time.Now()
 
-	// Fast path: recent cached listing.
+	// Fast path: recent cached listing. On this path the per-repo
+	// apiRootItems caches are still warm (repositoryAPITTL is 60s, same
+	// order as userReaddirTTL) so we don't need to block on a fresh
+	// prefetch — startPrefetchRepoContents is debounced and only fires
+	// to refresh stale entries in the background.
 	u.dirMu.Lock()
-	if u.dirNames != nil && time.Since(u.dirCachedAt) < userReaddirTTL {
-		names := u.dirNames
+	if u.dirListings != nil && time.Since(u.dirCachedAt) < userReaddirTTL {
+		listings := u.dirListings
 		age := time.Since(u.dirCachedAt)
 		u.dirMu.Unlock()
 		u.Logger.Debug("user.readdir: cache hit",
-			"user", u.Login, "count", len(names), "age", age.Round(time.Millisecond))
-		entries := u.buildEntries(ctx, names)
-		// Kick off the concurrent per-repo Contents warmup. Debounced
-		// internally so this is ~free on a hot cache.
-		u.startPrefetchRepoContents(names)
+			"user", u.Login, "count", len(listings), "age", age.Round(time.Millisecond))
+		entries := u.buildEntries(ctx, listings)
+		u.startPrefetchRepoContents(listings)
 		return fs.NewListDirStream(entries), 0
 	}
 	u.dirMu.Unlock()
 
-	names, pages, errno := u.listRepos(ctx)
+	listings, pages, errno := u.listRepos(ctx)
 	if errno != 0 {
 		return nil, errno
 	}
 
-	for _, name := range names {
-		u.rememberRepo(name)
+	for _, l := range listings {
+		u.rememberRepo(l.Name)
 	}
 	u.knownMu.Lock()
 	u.readdirDone = true
 	u.knownMu.Unlock()
 
 	u.dirMu.Lock()
-	u.dirNames = names
+	u.dirListings = listings
 	u.dirCachedAt = time.Now()
 	u.dirMu.Unlock()
 
@@ -404,31 +412,48 @@ func (u *User) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		"user", u.Login,
 		"owner_type", u.OwnerType,
 		"authed", u.IsAuthedUser,
-		"count", len(names),
+		"count", len(listings),
 		"pages", pages,
 		"elapsed", time.Since(started).Round(time.Millisecond))
 
-	entries := u.buildEntries(ctx, names)
-	// Fire the per-repo Contents warmup *after* child inodes exist so
-	// the prefetch can find them via u.GetChild.
-	u.startPrefetchRepoContents(names)
+	// Build child inodes (seeds pushedAt from the listing, so Getattr
+	// reports correct mtime without waiting on the GraphQL prefetch).
+	entries := u.buildEntries(ctx, listings)
+
+	// Cold path: prefetch *synchronously* so the per-repo Contents
+	// caches are already warm by the time eza / lsd / vscode start
+	// their per-repo opendir walk. Without this, the async prefetch
+	// races eza's REST waterfall (~130ms per repo, serialised by the
+	// consumer) and almost always loses — which is the pathology this
+	// function block is here to fix. Trades ~2s of Readdir latency for
+	// eliminating a ~N*RTT waterfall downstream. Debounced prefetch
+	// is kept on the cache-hit path above for the warm repeat case.
+	u.prefetchRepoContentsSync(listings)
+
 	return fs.NewListDirStream(entries), 0
 }
 
-// startPrefetchRepoContents kicks off a background warmup of every
-// child Repository's root Contents cache. git-aware ls tools (eza
-// --icons, lsd, lsd --classic, vscode file explorer) open every
-// sibling repo to pick icons or compute project type — which in our
-// FS means Repository.Readdir per child and one API round trip per
-// child. Kernel serialises those opendirs, so without concurrency
-// the user pays N * (network RTT + server latency) on the cold path.
+// startPrefetchRepoContents kicks off a *background* warmup of every
+// child Repository's root Contents cache. Used on the warm-cache
+// Readdir path (where the per-repo apiRootItems caches are usually
+// already fresh from a prior prefetch anyway, so we don't need to
+// block). git-aware ls tools (eza --icons, lsd, lsd --classic, vscode
+// file explorer) open every sibling repo to pick icons or compute
+// project type — which in our FS means Repository.Readdir per child
+// and one API round trip per child. Kernel serialises those opendirs,
+// so without concurrency the user pays N * (network RTT + server
+// latency) on the cold path.
+//
+// The cold path uses prefetchRepoContentsSync instead: on the very
+// first Readdir we *must* block until the cache is warm, because
+// otherwise eza's per-repo REST walk races the async batch and wins.
 //
 // Debounced via prefetchStartedAt: repeated Readdir within
 // userPrefetchSuppressDur (tab completion, fish autosuggest) re-use
 // the in-flight or recently-completed prefetch. Cache hits inside
 // cachedRootContents make repeated warmups idempotent anyway — the
 // debouncer just avoids spawning pointless goroutines.
-func (u *User) startPrefetchRepoContents(names []string) {
+func (u *User) startPrefetchRepoContents(listings []repoListing) {
 	u.prefetchMu.Lock()
 	if time.Since(u.prefetchStartedAt) < userPrefetchSuppressDur {
 		u.prefetchMu.Unlock()
@@ -437,26 +462,79 @@ func (u *User) startPrefetchRepoContents(names []string) {
 	u.prefetchStartedAt = time.Now()
 	u.prefetchMu.Unlock()
 
-	// Snapshot names to insulate the goroutine from caller-side mutation.
-	snapshot := append([]string(nil), names...)
-	go u.prefetchRepoContents(snapshot)
+	// Snapshot names — we only need the Name field for the lookup
+	// against u.GetChild; pushedAt was already seeded into inodes at
+	// buildEntries time.
+	snapshot := make([]string, len(listings))
+	for i, l := range listings {
+		snapshot[i] = l.Name
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), userPrefetchTimeout)
+		defer cancel()
+		u.runPrefetchRepoContents(ctx, snapshot, "graphql-async")
+	}()
 }
 
-// prefetchRepoContents is the body of the debounced background
-// prefetch. Populates every child Repository's root-Contents cache
-// via a single batched GraphQL query (chunked), falling back to the
-// REST fan-out if GraphQL fails wholesale. Errors past the fallback
-// are swallowed — a real Readdir will retry on demand.
+// prefetchRepoContentsSync is the synchronous cold-path variant.
+// Called inline from User.Readdir after a fresh listRepos so the
+// per-repo apiRootItems caches are warm before the caller (eza, lsd,
+// etc.) starts its per-repo opendir walk — eliminating the ~N*RTT
+// waterfall the async prefetch couldn't beat.
 //
-// The GraphQL path replaces what used to be ceil(N/16) serial rounds
-// of REST /contents/ calls with 1–ceil(N/50) batched POSTs, shaving
-// ~1.3s off a cold `ls ~/github.com/<owner>/` for a ~150-repo user.
-// On a warm httpcache the REST path would 304 near-instantly anyway,
-// so GraphQL is a pure win on cold paths and a wash on warm ones
-// (single POST ≈ 16 parallel conditional GETs). REST fallback keeps
-// us at worst status-quo on GraphQL outages / token-scoping issues
-// (fine-grained tokens without GraphQL access, etc).
-func (u *User) prefetchRepoContents(names []string) {
+// Detaches from the caller ctx and uses userPrefetchTimeout instead:
+// aggressive Readdir cancels (fish tab-completion cycling, Ctrl-C on
+// a long ls) would otherwise tear down a batch that's already paid
+// most of its cost, wasting the REST budget and leaving the next
+// Readdir just as cold as the first. The function still blocks
+// Readdir's return, so the latency tradeoff is unchanged — we just
+// refuse to abandon work we've already started.
+//
+// Also stamps prefetchStartedAt so a rapid follow-up cache-hit
+// Readdir doesn't re-fire the debounced async prefetch immediately.
+func (u *User) prefetchRepoContentsSync(listings []repoListing) {
+	u.prefetchMu.Lock()
+	u.prefetchStartedAt = time.Now()
+	u.prefetchMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), userPrefetchTimeout)
+	defer cancel()
+
+	names := make([]string, len(listings))
+	for i, l := range listings {
+		names[i] = l.Name
+	}
+	u.runPrefetchRepoContents(ctx, names, "graphql-sync")
+}
+
+// runPrefetchRepoContents is the shared body of the sync/async
+// prefetch paths. It warms two independent caches per child Repository:
+//
+//  1. Root tree contents via REST /contents/ fan-out (bounded by
+//     userPrefetchConcurrency). This is the latency-critical path: it's
+//     what eza/lsd/vscode wait on before they can decide icons /
+//     project-types for each child, and blocking Readdir past it is
+//     what eliminates the N*RTT waterfall downstream. Empirically
+//     ~10ms/repo under our 5K/hr REST budget.
+//
+//  2. Repo metadata (isArchived, default-branch head commit date) via a
+//     single batched GraphQL query, chunked. This is *refinement* —
+//     pushedAt (the only metadata field Repository.Getattr uses for
+//     mtime today) is already seeded from the REST listing at
+//     buildEntries time, so blocking Readdir on the GraphQL tail buys
+//     nothing. Fired in its own goroutine with a detached context and
+//     lands whenever it lands; a follow-up Readdir that's already
+//     cache-hit will see the refined values if they've arrived.
+//
+// The split matters for cold-path latency: on a 150-repo user the REST
+// fan-out finishes in ~1.3s while the GraphQL batch tail was taking an
+// additional ~1.4s when serial-awaited. With GraphQL detached, cold
+// Readdir returns as soon as REST is warm.
+//
+// REST failure is swallowed per-repo by cachedRootContents — a real
+// Readdir will retry on demand. GraphQL failure is logged in the
+// background goroutine and doesn't affect this function's return.
+func (u *User) runPrefetchRepoContents(ctx context.Context, names []string, strategy string) {
 	started := time.Now()
 
 	// Collect non-cloned Repository inodes. Cloned repos serve
@@ -481,47 +559,77 @@ func (u *User) prefetchRepoContents(names []string) {
 
 	if len(repos) == 0 {
 		u.Logger.Debug("user.prefetch: nothing to warm (all cloned / empty)",
-			"user", u.Login, "total", len(names))
+			"user", u.Login, "total", len(names), "strategy", strategy)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), userPrefetchTimeout)
-	defer cancel()
+	// Fire GraphQL metadata refinement in the background. Detached
+	// ctx so a Readdir-cancel (client disconnect) doesn't tear down a
+	// useful batch that's already paid the network round-trip.
+	go u.prefetchRepoMetadataBackground(repos, strategy)
 
-	written, err := u.batchRepoRootContents(ctx, repos)
-	if err != nil {
-		// Transport-level failure on at least one chunk — log and
-		// fall back to the per-repo REST fan-out. Any chunks that
-		// DID succeed already wrote their caches, so the fallback
-		// only incurs REST calls for the remaining (un-warmed) repos.
-		u.Logger.Warn("user.prefetch: graphql batch failed, falling back to REST",
-			"user", u.Login,
-			"warmed_before_fallback", written,
-			"total", len(repos),
-			"error", err)
-		u.prefetchRepoContentsREST(ctx, repos)
-	}
+	// Block on REST contents — this is what eza/lsd/vscode wait for.
+	u.prefetchRepoContentsREST(ctx, repos)
 
-	u.Logger.Debug("user.prefetch: done",
+	u.Logger.Debug("user.prefetch: rest done",
 		"user", u.Login,
-		"warmed", written,
 		"total", len(names),
 		"candidates", len(repos),
-		"strategy", "graphql",
+		"strategy", strategy,
 		"elapsed", time.Since(started).Round(time.Millisecond))
 }
 
-// prefetchRepoContentsREST is the legacy per-repo concurrent REST path,
-// used only as a fallback when the GraphQL batch call fails. Matches
-// the historical concurrency cap (userPrefetchConcurrency) and relies
-// on cachedRootContents's mutex to singleflight per-inode. Skips repos
-// whose cache was already populated by a partial GraphQL success.
+// prefetchRepoMetadataBackground runs the batched GraphQL metadata
+// refinement in its own goroutine with a detached, timeout-bounded
+// context. Safe to fire-and-forget: applyGraphQLEntry serialises writes
+// via r.apiMu, so if a later prefetch launches a second goroutine
+// before this one finishes the two just race harmlessly for last-writer
+// on each Repository's metadata fields.
+func (u *User) prefetchRepoMetadataBackground(repos []*Repository, strategy string) {
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), userPrefetchTimeout)
+	defer cancel()
+
+	written, err := u.batchRepoMetadata(ctx, repos)
+	if err != nil {
+		// Non-fatal: pushedAt was seeded from the REST listing at
+		// buildEntries time, and tree contents came from the REST
+		// fan-out in runPrefetchRepoContents. We just lose
+		// isArchived / default-branch head-commit-date refinement
+		// on this run.
+		u.Logger.Warn("user.prefetch: graphql metadata batch failed",
+			"user", u.Login,
+			"metadata_written", written,
+			"total", len(repos),
+			"strategy", strategy,
+			"error", err)
+		return
+	}
+	u.Logger.Debug("user.prefetch: metadata done",
+		"user", u.Login,
+		"metadata_written", written,
+		"total", len(repos),
+		"strategy", strategy,
+		"elapsed", time.Since(started).Round(time.Millisecond))
+}
+
+// prefetchRepoContentsREST is the authoritative root-tree-contents
+// warmup: one concurrent REST /contents/ fan-out (bounded by
+// userPrefetchConcurrency) that populates every non-cloned
+// Repository's apiRootItems cache. Runs concurrently with the GraphQL
+// metadata batch in runPrefetchRepoContents; the two paths write
+// disjoint fields so there's no coordination needed between them.
+//
+// Per-repo freshness check skips repos whose cache was populated
+// recently enough (usually from a prior prefetch run for the same
+// User, or a direct Readdir that beat the prefetch). cachedRootContents's
+// own mutex singleflights simultaneous warmups for the same inode so
+// there's no wasted work even without this check; it just keeps the
+// semaphore slot for a repo that actually needs it.
 func (u *User) prefetchRepoContentsREST(ctx context.Context, repos []*Repository) {
 	sem := make(chan struct{}, userPrefetchConcurrency)
 	var wg sync.WaitGroup
 	for _, r := range repos {
-		// Cheap check: if a prior partial GraphQL success already
-		// wrote this inode's cache, skip the REST round trip.
 		r.apiMu.Lock()
 		fresh := !r.apiRootCachedAt.IsZero() && time.Since(r.apiRootCachedAt) < repositoryAPITTL
 		r.apiMu.Unlock()
@@ -540,24 +648,50 @@ func (u *User) prefetchRepoContentsREST(ctx context.Context, repos []*Repository
 	wg.Wait()
 }
 
-// buildEntries converts the cached name slice into FUSE dirents and
-// pre-creates missing child inodes.
-func (u *User) buildEntries(ctx context.Context, names []string) []fuse.DirEntry {
-	entries := make([]fuse.DirEntry, 0, len(names))
-	for _, name := range names {
-		entries = append(entries, fuse.DirEntry{Name: name, Mode: fuse.S_IFDIR})
-		if u.GetChild(name) == nil {
-			child := u.NewInode(ctx, u.newRepository(name, ""), fs.StableAttr{Mode: fuse.S_IFDIR})
-			u.AddChild(name, child, false)
+// buildEntries converts the cached listing slice into FUSE dirents and
+// pre-creates missing child inodes. Seeds each Repository's pushedAt
+// from the listing so Repository.Getattr reports accurate mtime
+// immediately — no dependency on the GraphQL metadata prefetch
+// finishing first. For repos that already have a child inode (from a
+// prior Lookup or Readdir), we refresh pushedAt too so mtimes stay
+// current as GitHub's listing updates.
+func (u *User) buildEntries(ctx context.Context, listings []repoListing) []fuse.DirEntry {
+	entries := make([]fuse.DirEntry, 0, len(listings))
+	for _, l := range listings {
+		entries = append(entries, fuse.DirEntry{Name: l.Name, Mode: fuse.S_IFDIR})
+		if existing := u.GetChild(l.Name); existing != nil {
+			if repo, ok := existing.Operations().(*Repository); ok {
+				repo.setPushedAt(l.PushedAt)
+			}
+			continue
 		}
+		child := u.newRepository(l.Name, "")
+		child.setPushedAt(l.PushedAt)
+		inode := u.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFDIR})
+		u.AddChild(l.Name, inode, false)
 	}
 	return entries
 }
 
+// repoListing is the subset of a /{user,org}/repos entry we care about
+// at listing time. We used to pass just the name around, but the REST
+// response already carries pushed_at — surfacing it here lets
+// Repository.Getattr report correct mtime on the first ls without
+// waiting for the GraphQL metadata prefetch to finish (often too late
+// to beat eza's per-repo opendir walk).
+//
+// PushedAt is zero-valued if the API response omitted it (shouldn't
+// happen in practice for real repos, but GitHub has surprised us
+// before — applyGraphQLEntry treats zero as "unknown, leave alone").
+type repoListing struct {
+	Name     string
+	PushedAt time.Time
+}
+
 // listRepos paginates the appropriate GitHub endpoint for this owner
-// and returns the ordered repo names plus the number of pages fetched.
+// and returns the ordered listings plus the number of pages fetched.
 // Returns ENOENT on API error (consistent with prior behaviour).
-func (u *User) listRepos(ctx context.Context) ([]string, int, syscall.Errno) {
+func (u *User) listRepos(ctx context.Context) ([]repoListing, int, syscall.Errno) {
 	switch {
 	case u.OwnerType == "Organization":
 		return u.listOrgRepos(ctx)
@@ -570,12 +704,12 @@ func (u *User) listRepos(ctx context.Context) ([]string, int, syscall.Errno) {
 
 // listAuthedRepos hits GET /user/repos with affiliation=owner,collaborator.
 // This is the only way to see the authed user's private repos.
-func (u *User) listAuthedRepos(ctx context.Context) ([]string, int, syscall.Errno) {
+func (u *User) listAuthedRepos(ctx context.Context) ([]repoListing, int, syscall.Errno) {
 	opts := &github.RepositoryListByAuthenticatedUserOptions{
 		Affiliation: "owner,collaborator",
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
-	var names []string
+	var listings []repoListing
 	pages := 0
 	for {
 		repos, resp, err := u.Client.Repositories.ListByAuthenticatedUser(ctx, opts)
@@ -595,21 +729,24 @@ func (u *User) listAuthedRepos(ctx context.Context) ([]string, int, syscall.Errn
 			if *repo.Owner.Login != u.Login {
 				continue
 			}
-			names = append(names, *repo.Name)
+			listings = append(listings, repoListing{
+				Name:     *repo.Name,
+				PushedAt: repo.GetPushedAt().Time,
+			})
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-	return names, pages, 0
+	return listings, pages, 0
 }
 
 // listOrgRepos hits GET /orgs/{org}/repos which returns all repos
 // visible to the authed user (including private).
-func (u *User) listOrgRepos(ctx context.Context) ([]string, int, syscall.Errno) {
+func (u *User) listOrgRepos(ctx context.Context) ([]repoListing, int, syscall.Errno) {
 	opts := &github.RepositoryListByOrgOptions{ListOptions: github.ListOptions{PerPage: 100}}
-	var names []string
+	var listings []repoListing
 	pages := 0
 	for {
 		repos, resp, err := u.Client.Repositories.ListByOrg(ctx, u.Login, opts)
@@ -619,23 +756,27 @@ func (u *User) listOrgRepos(ctx context.Context) ([]string, int, syscall.Errno) 
 		}
 		pages++
 		for _, repo := range repos {
-			if repo.Name != nil {
-				names = append(names, *repo.Name)
+			if repo.Name == nil {
+				continue
 			}
+			listings = append(listings, repoListing{
+				Name:     *repo.Name,
+				PushedAt: repo.GetPushedAt().Time,
+			})
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-	return names, pages, 0
+	return listings, pages, 0
 }
 
 // listUserRepos hits GET /users/{login}/repos. Returns public repos
 // only — the API never exposes a third-party user's private repos.
-func (u *User) listUserRepos(ctx context.Context) ([]string, int, syscall.Errno) {
+func (u *User) listUserRepos(ctx context.Context) ([]repoListing, int, syscall.Errno) {
 	opts := &github.RepositoryListOptions{ListOptions: github.ListOptions{PerPage: 100}}
-	var names []string
+	var listings []repoListing
 	pages := 0
 	for {
 		repos, resp, err := u.Client.Repositories.List(ctx, u.Login, opts)
@@ -645,16 +786,20 @@ func (u *User) listUserRepos(ctx context.Context) ([]string, int, syscall.Errno)
 		}
 		pages++
 		for _, repo := range repos {
-			if repo.Name != nil {
-				names = append(names, *repo.Name)
+			if repo.Name == nil {
+				continue
 			}
+			listings = append(listings, repoListing{
+				Name:     *repo.Name,
+				PushedAt: repo.GetPushedAt().Time,
+			})
 		}
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-	return names, pages, 0
+	return listings, pages, 0
 }
 
 // rememberRepo records that owner/name exists.
@@ -757,9 +902,10 @@ type Repository struct {
 	Logger *slog.Logger
 
 	// apiMu guards apiRootItems + apiRootErrno + apiRootCachedAt +
-	// apiRootInflight — per-inode cache of the root Contents-API
-	// listing. eza --icons opens every sibling repo to pick
-	// project-type icons; without this each such probe is an HTTP
+	// apiRootInflight plus the repo-level metadata below (pushedAt,
+	// archived, defaultBranch, headCommitDate). Per-inode cache of the
+	// root Contents-API listing. eza --icons opens every sibling repo to
+	// pick project-type icons; without this each such probe is an HTTP
 	// round trip. Callers for different inodes proceed in parallel,
 	// which is what lets User.prefetchRepoContents warm N repos
 	// concurrently.
@@ -770,18 +916,34 @@ type Repository struct {
 	// cached; apiRootCachedAt.IsZero() means "no result recorded".
 	//
 	// Concurrency discipline: apiMu is only ever held across short
-	// critical sections (cache read/write) — never across a network
-	// call. Concurrent callers for the same inode singleflight via
-	// apiRootInflight: the first miss creates the channel, drops
-	// apiMu, fires the network call, then re-acquires apiMu to
-	// store + close the channel. Subsequent callers observe the
-	// channel, drop apiMu, and wait on it, then re-acquire apiMu to
-	// read the cached result.
+	// critical sections (cache read/write, metadata snapshot) — never
+	// across a network call. Concurrent callers for the same inode
+	// singleflight via apiRootInflight: the first miss creates the
+	// channel, drops apiMu, fires the network call, then re-acquires
+	// apiMu to store + close the channel. Subsequent callers observe
+	// the channel, drop apiMu, and wait on it, then re-acquire apiMu
+	// to read the cached result. This keeps Getattr's apiMu-protected
+	// pushedAt snapshot from stalling behind a slow /contents/ fetch.
 	apiMu           sync.Mutex
 	apiRootItems    []*github.RepositoryContent
 	apiRootErrno    syscall.Errno
 	apiRootCachedAt time.Time
 	apiRootInflight chan struct{} // non-nil while a contentsAt call is in flight; closed on completion
+
+	// Repo-level metadata populated by applyGraphQLEntry. pushedAt is
+	// the only one currently surfaced (Repository.Getattr mtime);
+	// headCommitDate, defaultBranch, archived are captured for future
+	// use (branch symlinks, xattrs) so the data is already local when
+	// we decide to surface it.
+	//
+	// All four are best-effort — zero/empty means "not fetched yet" or
+	// "not applicable" (empty repo has no defaultBranchRef, etc).
+	// Getattr treats a zero pushedAt as "don't set mtime" rather than
+	// stamping epoch onto the inode.
+	pushedAt       time.Time
+	headCommitDate time.Time
+	defaultBranch  string
+	archived       bool
 }
 
 // cachedRootContents returns the root Contents listing for this
@@ -845,12 +1007,51 @@ func (r *Repository) cachedRootContents(ctx context.Context) ([]*github.Reposito
 	}
 }
 
+// setPushedAt updates the repo's pushedAt under apiMu. No-op on zero
+// input so a missing field in one response path doesn't clobber a
+// real timestamp written by another (same nil-check discipline as
+// applyGraphQLEntry).
+func (r *Repository) setPushedAt(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	r.apiMu.Lock()
+	r.pushedAt = t
+	r.apiMu.Unlock()
+}
+
+
 var _ = (fs.NodeGetattrer)((*Repository)(nil))
 
+// Getattr reports the repo directory's FUSE attrs. mtime/ctime come
+// from pushedAt when we've fetched it (seeded from the /user/repos
+// listing at buildEntries time, or populated later by the GraphQL
+// prefetch), else stay at zero rather than lying with time.Now() —
+// the explicit 1970 is a signal to sorting tools ("unknown") whereas
+// a fabricated "yesterday" would poison `find -mtime` and `ls -lt`.
+//
+// atime is deliberately left unset: git doesn't track access, and
+// setting it to anything (including now) would just noise up tools.
+//
+// The attr timeout is userReaddirTTL (60s), not entryTimeout (30min):
+// pushedAt only refreshes when User.Readdir re-paginates the owner's
+// repos (bounded by userReaddirTTL) or the GraphQL metadata prefetch
+// fires. Caching longer would leave `ls -lt` stuck on a pre-push
+// mtime for up to half an hour after new work lands. Re-calling
+// Getattr at 60s is cheap — just a mutex-guarded read of pushedAt.
 func (r *Repository) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fuse.S_IFDIR | 0755
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(userReaddirTTL)
 	out.Nlink = 2
+
+	r.apiMu.Lock()
+	pushed := r.pushedAt
+	r.apiMu.Unlock()
+	if !pushed.IsZero() {
+		t := uint64(pushed.Unix())
+		out.Mtime = t
+		out.Ctime = t
+	}
 	return 0
 }
 

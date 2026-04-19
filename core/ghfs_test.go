@@ -269,6 +269,104 @@ func TestRepositoryCachedRootContents_ExpiredRefetches(t *testing.T) {
 	_, _ = r.cachedRootContents(context.Background())
 }
 
+// TestRepositoryGetattr_StampsPushedAtAsMtime verifies the main
+// user-visible effect of the GraphQL metadata prefetch: Repository dir
+// inodes report pushedAt as mtime/ctime so `ls -lt ~/github.com/<owner>/`
+// orders by activity. Without this the kernel serves uniform zero and
+// sort-by-modified is a no-op.
+func TestRepositoryGetattr_StampsPushedAtAsMtime(t *testing.T) {
+	t.Parallel()
+
+	pushed := time.Date(2026, 4, 19, 3, 16, 17, 0, time.UTC)
+	r := &Repository{
+		Owner:    "broady",
+		Name:     "ghfs",
+		pushedAt: pushed,
+	}
+
+	var out fuse.AttrOut
+	if errno := r.Getattr(context.Background(), nil, &out); errno != 0 {
+		t.Fatalf("Getattr: %v", errno)
+	}
+	if got, want := out.Mtime, uint64(pushed.Unix()); got != want {
+		t.Errorf("Mtime = %d, want %d", got, want)
+	}
+	if got, want := out.Ctime, uint64(pushed.Unix()); got != want {
+		t.Errorf("Ctime = %d, want %d", got, want)
+	}
+	if out.Mode&fuse.S_IFDIR == 0 {
+		t.Errorf("Mode = %o, want S_IFDIR bit set", out.Mode)
+	}
+}
+
+// TestRepositoryGetattr_ZeroPushedAtLeavesMtime checks the honest-
+// ignorance case: if we haven't fetched metadata yet (pre-GraphQL-batch
+// or on a token that can't hit GraphQL), pushedAt is zero and Getattr
+// must leave Mtime at 0 rather than fabricating a time.Now() — otherwise
+// `find -mtime -1` would match every untouched repo.
+func TestRepositoryGetattr_ZeroPushedAtLeavesMtime(t *testing.T) {
+	t.Parallel()
+
+	r := &Repository{Owner: "broady", Name: "never-warmed"}
+	var out fuse.AttrOut
+	if errno := r.Getattr(context.Background(), nil, &out); errno != 0 {
+		t.Fatalf("Getattr: %v", errno)
+	}
+	if out.Mtime != 0 {
+		t.Errorf("Mtime = %d, want 0 (honest unknown)", out.Mtime)
+	}
+	if out.Ctime != 0 {
+		t.Errorf("Ctime = %d, want 0", out.Ctime)
+	}
+}
+
+// TestRepositoryGetattr_AttrTimeoutTracksReaddirTTL pins the
+// short attr-timeout fix: Repository mtime reflects pushedAt, which
+// only refreshes when User.Readdir re-paginates the owner's repos
+// (at most every userReaddirTTL). If Getattr returned the kernel's
+// entryTimeout (30m), `ls -lt` would stay stuck on a stale pushedAt
+// for half an hour after a new push landed. Regression guard for
+// anyone copy-pasting the Dir/File/User.Getattr template which all
+// legitimately use entryTimeout.
+func TestRepositoryGetattr_AttrTimeoutTracksReaddirTTL(t *testing.T) {
+	t.Parallel()
+
+	r := &Repository{Owner: "broady", Name: "ghfs"}
+	var out fuse.AttrOut
+	if errno := r.Getattr(context.Background(), nil, &out); errno != 0 {
+		t.Fatalf("Getattr: %v", errno)
+	}
+	if got, want := out.Timeout(), userReaddirTTL; got != want {
+		t.Errorf("AttrTimeout = %v, want %v (pushedAt only refreshes at this cadence)", got, want)
+	}
+	if out.Timeout() >= entryTimeout {
+		t.Errorf("AttrTimeout = %v, must be well under entryTimeout=%v to track pushedAt freshness", out.Timeout(), entryTimeout)
+	}
+}
+
+// TestSetPushedAt_IgnoresZero guards the nil-check discipline in
+// setPushedAt: a subsequent call with zero time must not clobber a
+// real timestamp written earlier. This matters because the REST
+// listing path (buildEntries) and the GraphQL prefetch path
+// (applyGraphQLEntry) both write pushedAt — and if one of them runs
+// with a missing value, the inode must keep the last good one.
+func TestSetPushedAt_IgnoresZero(t *testing.T) {
+	t.Parallel()
+
+	existing := time.Date(2026, 4, 19, 0, 0, 0, 0, time.UTC)
+	r := &Repository{Owner: "broady", Name: "ghfs", pushedAt: existing}
+	r.setPushedAt(time.Time{}) // zero input — must be a no-op
+	if !r.pushedAt.Equal(existing) {
+		t.Errorf("pushedAt = %v, want %v preserved (zero input must not clobber)", r.pushedAt, existing)
+	}
+
+	newer := existing.Add(24 * time.Hour)
+	r.setPushedAt(newer)
+	if !r.pushedAt.Equal(newer) {
+		t.Errorf("pushedAt = %v, want %v (non-zero input must overwrite)", r.pushedAt, newer)
+	}
+}
+
 // Regression: blobless clones run batch-check with GIT_NO_LAZY_FETCH
 // so every blob is reported "missing" and the tree index keeps
 // SizeState="unknown", SizeBytes=0. File.Getattr used to report

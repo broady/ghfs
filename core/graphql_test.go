@@ -10,25 +10,24 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/go-github/v60/github"
 )
 
-// TestBuildRootContentsQuery_AliasesAndEscaping checks that every repo
-// gets a distinct alias, that owner/name are JSON-encoded (defensive
-// against a future widening of GitHub's naming rules), and that the
-// query includes the Tree-entry selection set cachedRootContents
-// consumers expect (name, type, mode, oid, blob byteSize).
-func TestBuildRootContentsQuery_AliasesAndEscaping(t *testing.T) {
+// TestBuildRepoMetadataQuery_AliasesAndEscaping checks that every repo
+// gets a distinct alias and that owner/name are JSON-encoded (defensive
+// against a future widening of GitHub's naming rules that would permit
+// embedded quotes).
+func TestBuildRepoMetadataQuery_AliasesAndEscaping(t *testing.T) {
 	t.Parallel()
 
 	repos := []*Repository{
 		{Owner: "broady", Name: "ghfs"},
 		{Owner: "broady", Name: "with\"quote"}, // would never happen in practice, but we should handle it
 	}
-	q, aliases := buildRootContentsQuery(repos)
+	q, aliases := buildRepoMetadataQuery(repos)
 
 	if len(aliases) != len(repos) {
 		t.Fatalf("alias count = %d, want %d", len(aliases), len(repos))
@@ -42,14 +41,6 @@ func TestBuildRootContentsQuery_AliasesAndEscaping(t *testing.T) {
 		`r0: repository(owner:"broady", name:"ghfs")`,
 		// Second repo's name is `with"quote` → JSON-encoded as `"with\"quote"`.
 		`r1: repository(owner:"broady", name:"with\"quote")`,
-		`object(expression:"HEAD:")`,
-		"... on Tree",
-		"entries {",
-		"name",
-		"type",
-		"mode",
-		"oid",
-		"... on Blob { byteSize }",
 	} {
 		if !strings.Contains(q, want) {
 			t.Errorf("query missing %q\n---query---\n%s", want, q)
@@ -57,51 +48,48 @@ func TestBuildRootContentsQuery_AliasesAndEscaping(t *testing.T) {
 	}
 }
 
-// TestContentTypeFromTreeEntry verifies the TreeEntry → REST type
-// mapping is exhaustive. Submodules must be dropped (upstream
-// newInodeFromContent already skips `submodule`, but we drop earlier
-// to keep apiRootItems small).
-func TestContentTypeFromTreeEntry(t *testing.T) {
+// TestBuildRepoMetadataQuery_IncludesMetadata asserts the
+// repo-level fields + rateLimit envelope are wired into the query.
+// If someone refactors the builder and quietly drops one, Repository
+// mtime silently degrades to zero — this test catches that.
+func TestBuildRepoMetadataQuery_IncludesMetadata(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
-		name string
-		in   graphqlTreeEntry
-		want string
-	}{
-		{"dir", graphqlTreeEntry{Type: "tree"}, "dir"},
-		{"file", graphqlTreeEntry{Type: "blob", Mode: 0o100644}, "file"},
-		{"exec-file", graphqlTreeEntry{Type: "blob", Mode: 0o100755}, "file"},
-		{"symlink", graphqlTreeEntry{Type: "blob", Mode: 0o120000}, "symlink"},
-		{"submodule-dropped", graphqlTreeEntry{Type: "commit"}, ""},
-		{"unknown-dropped", graphqlTreeEntry{Type: "???"}, ""},
-	}
-	for _, c := range cases {
-		got := contentTypeFromTreeEntry(c.in)
-		if got != c.want {
-			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+	q, _ := buildRepoMetadataQuery([]*Repository{{Owner: "broady", Name: "ghfs"}})
+
+	for _, want := range []string{
+		"rateLimit { cost remaining resetAt limit nodeCount }",
+		"pushedAt",
+		"isArchived",
+		"defaultBranchRef {",
+		"... on Commit { committedDate oid }",
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("query missing %q\n---query---\n%s", want, q)
 		}
 	}
 }
 
-// TestApplyGraphQLEntry_PopulatesCache verifies applyGraphQLEntry writes
-// an identically-shaped cache to what cachedRootContents would after a
-// REST call — name/type/path/sha/size all round-trip.
-func TestApplyGraphQLEntry_PopulatesCache(t *testing.T) {
+// TestApplyGraphQLEntry_PopulatesMetadata verifies the full-happy-path
+// repo-level fields land on the Repository struct. The pre-flight
+// probe against real GitHub confirmed the server returns them in this
+// shape for any non-empty repo.
+func TestApplyGraphQLEntry_PopulatesMetadata(t *testing.T) {
 	t.Parallel()
 
-	var bs int64 = 4096
+	pushed := time.Date(2026, 4, 19, 10, 0, 0, 0, time.UTC)
+	committed := time.Date(2026, 4, 18, 9, 0, 0, 0, time.UTC)
+	archived := false
+
 	entry := &graphqlRepoResult{
-		Object: &graphqlObject{
-			Typename: "Tree",
-			Entries: []graphqlTreeEntry{
-				{Name: "README.md", Type: "blob", Mode: 0o100644, OID: "abc123",
-					Object: &graphqlEntryObject{Typename: "Blob", ByteSize: &bs}},
-				{Name: "core", Type: "tree", Mode: 0o040000, OID: "deadbeef",
-					Object: &graphqlEntryObject{Typename: "Tree"}},
-				{Name: "link", Type: "blob", Mode: 0o120000, OID: "cafef00d",
-					Object: &graphqlEntryObject{Typename: "Blob"}},
-				{Name: "vendor-mod", Type: "commit", Mode: 0o160000, OID: "1234"}, // dropped
+		PushedAt:   &pushed,
+		IsArchived: &archived,
+		DefaultBranchRef: &graphqlBranchRef{
+			Name: "main",
+			Target: &graphqlBranchTarget{
+				Typename:      "Commit",
+				CommittedDate: &committed,
+				OID:           "d35486eb",
 			},
 		},
 	}
@@ -109,73 +97,175 @@ func TestApplyGraphQLEntry_PopulatesCache(t *testing.T) {
 	r := &Repository{Owner: "broady", Name: "ghfs"}
 	applyGraphQLEntry(r, entry)
 
-	if r.apiRootErrno != 0 {
-		t.Fatalf("apiRootErrno = %v, want 0", r.apiRootErrno)
+	if !r.pushedAt.Equal(pushed) {
+		t.Errorf("pushedAt = %v, want %v", r.pushedAt, pushed)
 	}
-	if r.apiRootCachedAt.IsZero() {
-		t.Error("apiRootCachedAt should be set")
+	if !r.headCommitDate.Equal(committed) {
+		t.Errorf("headCommitDate = %v, want %v", r.headCommitDate, committed)
 	}
-	if len(r.apiRootItems) != 3 {
-		t.Fatalf("items = %d, want 3 (submodule must be dropped)", len(r.apiRootItems))
+	if r.defaultBranch != "main" {
+		t.Errorf("defaultBranch = %q, want %q", r.defaultBranch, "main")
 	}
-
-	// Spot-check each entry's shape.
-	want := []struct{ name, typ string }{
-		{"README.md", "file"},
-		{"core", "dir"},
-		{"link", "symlink"},
-	}
-	for i, w := range want {
-		item := r.apiRootItems[i]
-		if item.Name == nil || *item.Name != w.name {
-			t.Errorf("item[%d].Name = %v, want %q", i, item.Name, w.name)
-		}
-		if item.Path == nil || *item.Path != w.name {
-			t.Errorf("item[%d].Path = %v, want %q (path==name for root)", i, item.Path, w.name)
-		}
-		if item.Type == nil || *item.Type != w.typ {
-			t.Errorf("item[%d].Type = %v, want %q", i, item.Type, w.typ)
-		}
-	}
-	// byteSize round-trips to Size (*int, not *int64).
-	if r.apiRootItems[0].Size == nil || *r.apiRootItems[0].Size != 4096 {
-		t.Errorf("README.md Size = %v, want 4096", r.apiRootItems[0].Size)
-	}
-	// SHA also populated, for lazy Open against the hydrator.
-	if r.apiRootItems[0].SHA == nil || *r.apiRootItems[0].SHA != "abc123" {
-		t.Errorf("README.md SHA = %v, want abc123", r.apiRootItems[0].SHA)
+	if r.archived != false {
+		t.Errorf("archived = %v, want false", r.archived)
 	}
 }
 
-// TestApplyGraphQLEntry_NullObjectENOENT verifies that a repo with no
-// HEAD (e.g. no commits yet) gets negative-cached as ENOENT — matching
-// the REST path's treatment of /contents/ returning 404.
-func TestApplyGraphQLEntry_NullObjectENOENT(t *testing.T) {
+// TestApplyGraphQLEntry_EmptyRepoStillStampsPushedAt is the empty-repo
+// case: defaultBranchRef is null (no commits ⇒ no head), but pushedAt
+// is still present. The bug to prevent: a sparse response must still
+// stamp pushedAt so every empty repo doesn't end up at epoch-zero mtime
+// despite having a perfectly valid creation timestamp.
+func TestApplyGraphQLEntry_EmptyRepoStillStampsPushedAt(t *testing.T) {
 	t.Parallel()
 
-	r := &Repository{Owner: "broady", Name: "brand-new-empty"}
-	applyGraphQLEntry(r, &graphqlRepoResult{Object: nil})
+	pushed := time.Date(2019, 10, 30, 16, 46, 6, 0, time.UTC)
+	archived := false
+	entry := &graphqlRepoResult{
+		PushedAt:         &pushed,
+		IsArchived:       &archived,
+		DefaultBranchRef: nil, // empty repo: no commits, so no default branch
+	}
 
-	if r.apiRootErrno != syscall.ENOENT {
-		t.Errorf("apiRootErrno = %v, want ENOENT", r.apiRootErrno)
+	r := &Repository{Owner: "broady", Name: "some-old-empty"}
+	applyGraphQLEntry(r, entry)
+
+	// pushedAt landed despite the null defaultBranchRef.
+	if !r.pushedAt.Equal(pushed) {
+		t.Errorf("pushedAt = %v, want %v (must be applied independently of defaultBranchRef)", r.pushedAt, pushed)
 	}
-	if r.apiRootItems != nil {
-		t.Errorf("apiRootItems = %v, want nil", r.apiRootItems)
+	// defaultBranch / headCommitDate stay zero because we got nothing
+	// useful for them — don't fabricate a branch name.
+	if r.defaultBranch != "" {
+		t.Errorf("defaultBranch = %q, want empty (no defaultBranchRef)", r.defaultBranch)
 	}
-	if r.apiRootCachedAt.IsZero() {
-		t.Error("apiRootCachedAt should be set so we don't re-probe every ls")
+	if !r.headCommitDate.IsZero() {
+		t.Errorf("headCommitDate = %v, want zero (no target commit)", r.headCommitDate)
 	}
 }
 
-// TestBatchRepoRootContents_EndToEnd spins up an httptest server that
-// plays the role of api.github.com/graphql, verifies the request shape,
-// returns a canned response with two repos + one empty, and confirms
-// each Repository's cache reflects the expected outcome.
+// TestApplyGraphQLEntry_NilFieldsDoNotClobber guards the nil-check
+// discipline in applyGraphQLEntry. A partial response (say, the
+// GraphQL server drops a field during an incident) must not overwrite
+// a previously-known timestamp with the zero value — the worst
+// outcome is a stale mtime, not a fake 1970 one.
+func TestApplyGraphQLEntry_NilFieldsDoNotClobber(t *testing.T) {
+	t.Parallel()
+
+	existing := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r := &Repository{
+		Owner:          "broady",
+		Name:           "ghfs",
+		pushedAt:       existing,
+		headCommitDate: existing,
+		defaultBranch:  "main",
+		archived:       true,
+	}
+	// Entry with every metadata field nil.
+	entry := &graphqlRepoResult{}
+	applyGraphQLEntry(r, entry)
+
+	if !r.pushedAt.Equal(existing) {
+		t.Errorf("pushedAt = %v, want %v (nil must not clobber)", r.pushedAt, existing)
+	}
+	if !r.headCommitDate.Equal(existing) {
+		t.Errorf("headCommitDate = %v, want %v", r.headCommitDate, existing)
+	}
+	if r.defaultBranch != "main" {
+		t.Errorf("defaultBranch = %q, want %q", r.defaultBranch, "main")
+	}
+	if !r.archived {
+		t.Errorf("archived = false, want true preserved")
+	}
+}
+
+// TestApplyGraphQLEntry_AnnotatedTagDefaultBranch covers the rare case
+// of a default branch pointing at an annotated tag — Typename won't be
+// "Commit" so committedDate is untrustworthy. We still capture the
+// branch name for potential future use but leave headCommitDate zero.
+func TestApplyGraphQLEntry_AnnotatedTagDefaultBranch(t *testing.T) {
+	t.Parallel()
+
+	tagDate := time.Date(2026, 4, 19, 0, 0, 0, 0, time.UTC)
+	entry := &graphqlRepoResult{
+		DefaultBranchRef: &graphqlBranchRef{
+			Name: "weird-tag-branch",
+			Target: &graphqlBranchTarget{
+				Typename:      "Tag",
+				CommittedDate: &tagDate, // would be nil in practice but be defensive
+			},
+		},
+	}
+	r := &Repository{Owner: "broady", Name: "weirdo"}
+	applyGraphQLEntry(r, entry)
+
+	if r.defaultBranch != "weird-tag-branch" {
+		t.Errorf("defaultBranch = %q, want %q", r.defaultBranch, "weird-tag-branch")
+	}
+	if !r.headCommitDate.IsZero() {
+		t.Errorf("headCommitDate = %v, want zero (target isn't a Commit)", r.headCommitDate)
+	}
+}
+
+// TestBatchChunk_DecodesRateLimit verifies rateLimit is picked up from
+// the same data map that carries the alias results, without interfering
+// with alias iteration or getting mistaken for a repo.
+//
+// Not t.Parallel: shares graphqlEndpointForTest.
+func TestBatchChunk_DecodesRateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"data": {
+				"rateLimit": {"cost":1,"remaining":4999,"resetAt":"2026-04-19T18:00:00Z","limit":5000,"nodeCount":0},
+				"r0": {
+					"pushedAt": "2026-04-19T03:16:17Z",
+					"isArchived": false,
+					"defaultBranchRef": {"name":"main","target":{"__typename":"Commit","committedDate":"2026-04-18T10:03:35Z","oid":"abc"}},
+					"object": {"__typename":"Tree","entries":[]}
+				}
+			}
+		}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	orig := graphqlEndpointForTest
+	graphqlEndpointForTest = srv.URL
+	t.Cleanup(func() { graphqlEndpointForTest = orig })
+
+	u := &User{
+		Login:  "broady",
+		Client: github.NewClient(srv.Client()),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	repos := []*Repository{{Owner: "broady", Name: "ghfs"}}
+	written, err := u.batchRepoMetadata(context.Background(), repos)
+	if err != nil {
+		t.Fatalf("batchRepoMetadata: %v", err)
+	}
+	if written != 1 {
+		t.Errorf("written = %d, want 1 (rateLimit key must not be counted as an alias)", written)
+	}
+	// Metadata landed on r0.
+	if repos[0].pushedAt.IsZero() {
+		t.Error("pushedAt should be populated from the response")
+	}
+	if repos[0].defaultBranch != "main" {
+		t.Errorf("defaultBranch = %q, want %q", repos[0].defaultBranch, "main")
+	}
+}
+
+// TestBatchRepoMetadata_EndToEnd spins up an httptest server that plays
+// the role of api.github.com/graphql, verifies the request shape,
+// returns a canned response with one populated repo, one empty repo
+// (defaultBranchRef null), and one permission-denied repo (null alias +
+// errors[]), and confirms each Repository's metadata reflects the
+// expected outcome.
 //
 // Not t.Parallel: mutates the package-level graphqlEndpointForTest
 // seam, which the other http-backed tests in this file also touch.
 // Pure-parsing tests stay parallel.
-func TestBatchRepoRootContents_EndToEnd(t *testing.T) {
+func TestBatchRepoMetadata_EndToEnd(t *testing.T) {
 	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		requests.Add(1)
@@ -192,16 +282,23 @@ func TestBatchRepoRootContents_EndToEnd(t *testing.T) {
 				t.Errorf("query missing alias %q; body=%s", alias, body)
 			}
 		}
-		// Canned response: r0 populated (ghfs), r1 empty (no HEAD), r2
-		// has errors + null data (simulating a permission denial).
+		// Canned response: r0 fully populated, r1 empty (pushedAt set
+		// but no defaultBranchRef — mirrors GitHub's shape for a repo
+		// with zero commits), r2 has errors + null data (permission
+		// denial).
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{
 			"data": {
-				"r0": {"object": {"__typename":"Tree","entries":[
-					{"name":"README.md","type":"blob","mode":33188,"oid":"a1","object":{"__typename":"Blob","byteSize":123}},
-					{"name":"src","type":"tree","mode":16384,"oid":"b2","object":{"__typename":"Tree"}}
-				]}},
-				"r1": {"object": null},
+				"r0": {
+					"pushedAt": "2026-04-19T03:16:17Z",
+					"isArchived": false,
+					"defaultBranchRef": {"name":"main","target":{"__typename":"Commit","committedDate":"2026-04-18T10:03:35Z","oid":"abc"}}
+				},
+				"r1": {
+					"pushedAt": "2026-04-01T00:00:00Z",
+					"isArchived": false,
+					"defaultBranchRef": null
+				},
 				"r2": null
 			},
 			"errors": [
@@ -231,48 +328,54 @@ func TestBatchRepoRootContents_EndToEnd(t *testing.T) {
 		Client: github.NewClient(srv.Client()),
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	written, err := u.batchRepoRootContents(context.Background(), repos)
+	written, err := u.batchRepoMetadata(context.Background(), repos)
 	if err != nil {
-		t.Fatalf("batchRepoRootContents: %v", err)
+		t.Fatalf("batchRepoMetadata: %v", err)
 	}
 	if got := requests.Load(); got != 1 {
 		t.Errorf("requests = %d, want 1 (single batched POST)", got)
 	}
-	// r0 + r1 wrote caches; r2 was null so we left its cache alone.
+	// r0 + r1 were applied; r2 was null so we skipped it entirely.
 	if written != 2 {
 		t.Errorf("written = %d, want 2", written)
 	}
 
-	// r0: populated.
-	if repos[0].apiRootErrno != 0 {
-		t.Errorf("ghfs errno = %v, want 0", repos[0].apiRootErrno)
+	// r0: full metadata landed on the struct.
+	if repos[0].pushedAt.IsZero() {
+		t.Error("ghfs pushedAt should be populated")
 	}
-	if len(repos[0].apiRootItems) != 2 {
-		t.Errorf("ghfs items = %d, want 2", len(repos[0].apiRootItems))
+	if repos[0].defaultBranch != "main" {
+		t.Errorf("ghfs defaultBranch = %q, want %q", repos[0].defaultBranch, "main")
 	}
-
-	// r1: empty repo → ENOENT cached.
-	if repos[1].apiRootErrno != syscall.ENOENT {
-		t.Errorf("empty-repo errno = %v, want ENOENT", repos[1].apiRootErrno)
-	}
-	if repos[1].apiRootCachedAt.IsZero() {
-		t.Error("empty-repo cachedAt should be set (negative-cache)")
+	if repos[0].headCommitDate.IsZero() {
+		t.Error("ghfs headCommitDate should be populated from Commit target")
 	}
 
-	// r2: null data → cache untouched, next Readdir falls through to REST.
-	if !repos[2].apiRootCachedAt.IsZero() {
-		t.Error("private-denied cache should NOT be touched when data=null + errors[]")
+	// r1: pushedAt populated, but defaultBranchRef null → defaultBranch
+	// and headCommitDate remain zero. applyGraphQLEntry's nil checks
+	// keep us from clobbering a previously-set value with a zero.
+	if repos[1].pushedAt.IsZero() {
+		t.Error("empty-repo pushedAt should be populated")
+	}
+	if repos[1].defaultBranch != "" {
+		t.Errorf("empty-repo defaultBranch = %q, want empty (no ref)", repos[1].defaultBranch)
+	}
+
+	// r2: null alias → metadata untouched. No assertion on specific
+	// fields beyond "we didn't panic and didn't count it as written".
+	if !repos[2].pushedAt.IsZero() {
+		t.Error("private-denied pushedAt should NOT be touched when data=null")
 	}
 }
 
-// TestBatchRepoRootContents_HTTPErrorPropagates verifies that a 5xx or
+// TestBatchRepoMetadata_HTTPErrorPropagates verifies that a 5xx or
 // network-level failure surfaces as an error so prefetchRepoContents
 // can fall back to the REST path rather than silently losing the
 // warmup.
 //
 // Not t.Parallel: shares the graphqlEndpointForTest seam with
-// TestBatchRepoRootContents_EndToEnd and TestPostGraphQL_DecodeError.
-func TestBatchRepoRootContents_HTTPErrorPropagates(t *testing.T) {
+// TestBatchRepoMetadata_EndToEnd and TestPostGraphQL_DecodeError.
+func TestBatchRepoMetadata_HTTPErrorPropagates(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = io.WriteString(w, `{"message":"upstream down"}`)
@@ -289,7 +392,7 @@ func TestBatchRepoRootContents_HTTPErrorPropagates(t *testing.T) {
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	repos := []*Repository{{Owner: "broady", Name: "ghfs"}}
-	written, err := u.batchRepoRootContents(context.Background(), repos)
+	written, err := u.batchRepoMetadata(context.Background(), repos)
 	if err == nil {
 		t.Fatal("expected error from 502 response, got nil")
 	}

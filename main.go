@@ -64,6 +64,15 @@ func main() {
 	if flag.NArg() != 1 {
 		log.Fatal("path required")
 	}
+	// Fall back to $GITHUB_TOKEN so callers (e.g. systemd units) can pass the
+	// token via env instead of an argv flag, keeping it out of `ps` / cmdline.
+	// Unset immediately so spawned child processes don't inherit it.
+	if *token == "" {
+		if env := os.Getenv("GITHUB_TOKEN"); env != "" {
+			*token = env
+			os.Unsetenv("GITHUB_TOKEN")
+		}
+	}
 	if *token == "" && !*anonymous {
 		log.Fatal("must provide either -token or -anonymous flag")
 	}
