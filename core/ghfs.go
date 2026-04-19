@@ -121,6 +121,32 @@ const entryTimeout = 30 * time.Minute
 // Repositories.Get on cache miss.
 const userReaddirTTL = 60 * time.Second
 
+// repositoryAPITTL is how long Repository caches its root Contents-API
+// listing (the /repos/<owner>/<repo>/contents/ call). eza --icons
+// opens every sibling repo to pick project-type icons, so without a
+// per-inode cache each `ls ~/github.com/<owner>/` costs one round
+// trip per repo — N serial calls because the kernel dispatches each
+// child opendir separately. 60s matches userReaddirTTL and GitHub's
+// typical max-age=60 on Contents responses.
+const repositoryAPITTL = 60 * time.Second
+
+// userPrefetchConcurrency bounds how many child repos User.Readdir
+// warms in parallel. Deliberately smaller than GitHub's concurrent-
+// request ceiling so a single ghfs process doesn't monopolise the
+// token's rate budget.
+const userPrefetchConcurrency = 16
+
+// userPrefetchSuppressDur debounces prefetches. Tab completion, fish
+// autosuggest, and rapid-fire `ls` all trigger User.Readdir; we only
+// want to kick the concurrent prefetch once per window.
+const userPrefetchSuppressDur = 30 * time.Second
+
+// userPrefetchTimeout caps a single prefetch run. The run can't
+// inherit the Readdir context (that cancels as soon as Readdir
+// returns, killing every in-flight prefetch) so we use a detached
+// context bounded by this.
+const userPrefetchTimeout = 30 * time.Second
+
 // FS is the filesystem root — one dir per GitHub user/org. It owns no
 // git state; that lives in the reposrc.Manager.
 type FS struct {
@@ -166,11 +192,19 @@ func (f *FS) authLogin(ctx context.Context) string {
 var _ = (fs.NodeLookuper)((*FS)(nil))
 
 // Lookup resolves a top-level owner/org name via Users.Get.
+//
+// Do NOT pre-set out.SetEntryTimeout here. The rawBridge in go-fuse
+// only applies NegativeTimeout on ENOENT if out.EntryTimeout() == 0
+// (bridge.go:362). If we pre-set it, every failed lookup leaks a
+// zero-lifetime negative dentry and the kernel re-enters this handler
+// on every probe — which is exactly what was making every fish_prompt
+// render re-hit Users.Get for names like "HEAD". Successful returns
+// still get entryTimeout applied by the bridge via setEntryOutTimeout
+// (mount options set EntryTimeout=30min in main.go).
 func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if isBlockedTopLevel(name) {
 		return nil, syscall.ENOENT
 	}
-	out.SetEntryTimeout(entryTimeout)
 
 	if existing := f.GetChild(name); existing != nil {
 		return existing, 0
@@ -275,6 +309,13 @@ type User struct {
 	dirMu       sync.Mutex
 	dirNames    []string  // last successful listing, in API order
 	dirCachedAt time.Time // zero value = no cache yet
+
+	// prefetchMu guards prefetchStartedAt — debounces
+	// startPrefetchRepoContents so a rapid sequence of User.Readdir
+	// calls doesn't fan out the same 148 concurrent API requests
+	// over and over.
+	prefetchMu        sync.Mutex
+	prefetchStartedAt time.Time
 }
 
 var _ = (fs.NodeGetattrer)((*User)(nil))
@@ -316,7 +357,11 @@ func (u *User) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		u.dirMu.Unlock()
 		u.Logger.Debug("user.readdir: cache hit",
 			"user", u.Login, "count", len(names), "age", age.Round(time.Millisecond))
-		return fs.NewListDirStream(u.buildEntries(ctx, names)), 0
+		entries := u.buildEntries(ctx, names)
+		// Kick off the concurrent per-repo Contents warmup. Debounced
+		// internally so this is ~free on a hot cache.
+		u.startPrefetchRepoContents(names)
+		return fs.NewListDirStream(entries), 0
 	}
 	u.dirMu.Unlock()
 
@@ -345,7 +390,136 @@ func (u *User) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		"pages", pages,
 		"elapsed", time.Since(started).Round(time.Millisecond))
 
-	return fs.NewListDirStream(u.buildEntries(ctx, names)), 0
+	entries := u.buildEntries(ctx, names)
+	// Fire the per-repo Contents warmup *after* child inodes exist so
+	// the prefetch can find them via u.GetChild.
+	u.startPrefetchRepoContents(names)
+	return fs.NewListDirStream(entries), 0
+}
+
+// startPrefetchRepoContents kicks off a background warmup of every
+// child Repository's root Contents cache. git-aware ls tools (eza
+// --icons, lsd, lsd --classic, vscode file explorer) open every
+// sibling repo to pick icons or compute project type — which in our
+// FS means Repository.Readdir per child and one API round trip per
+// child. Kernel serialises those opendirs, so without concurrency
+// the user pays N * (network RTT + server latency) on the cold path.
+//
+// Debounced via prefetchStartedAt: repeated Readdir within
+// userPrefetchSuppressDur (tab completion, fish autosuggest) re-use
+// the in-flight or recently-completed prefetch. Cache hits inside
+// cachedRootContents make repeated warmups idempotent anyway — the
+// debouncer just avoids spawning pointless goroutines.
+func (u *User) startPrefetchRepoContents(names []string) {
+	u.prefetchMu.Lock()
+	if time.Since(u.prefetchStartedAt) < userPrefetchSuppressDur {
+		u.prefetchMu.Unlock()
+		return
+	}
+	u.prefetchStartedAt = time.Now()
+	u.prefetchMu.Unlock()
+
+	// Snapshot names to insulate the goroutine from caller-side mutation.
+	snapshot := append([]string(nil), names...)
+	go u.prefetchRepoContents(snapshot)
+}
+
+// prefetchRepoContents is the body of the debounced background
+// prefetch. Populates every child Repository's root-Contents cache
+// via a single batched GraphQL query (chunked), falling back to the
+// REST fan-out if GraphQL fails wholesale. Errors past the fallback
+// are swallowed — a real Readdir will retry on demand.
+//
+// The GraphQL path replaces what used to be ceil(N/16) serial rounds
+// of REST /contents/ calls with 1–ceil(N/50) batched POSTs, shaving
+// ~1.3s off a cold `ls ~/github.com/<owner>/` for a ~150-repo user.
+// On a warm httpcache the REST path would 304 near-instantly anyway,
+// so GraphQL is a pure win on cold paths and a wash on warm ones
+// (single POST ≈ 16 parallel conditional GETs). REST fallback keeps
+// us at worst status-quo on GraphQL outages / token-scoping issues
+// (fine-grained tokens without GraphQL access, etc).
+func (u *User) prefetchRepoContents(names []string) {
+	started := time.Now()
+
+	// Collect non-cloned Repository inodes. Cloned repos serve
+	// Readdir from the local tree, so warming the API cache is
+	// pointless — and would poison a Readdir that's about to start
+	// returning tree-accurate mode bits.
+	repos := make([]*Repository, 0, len(names))
+	for _, name := range names {
+		child := u.GetChild(name)
+		if child == nil {
+			continue
+		}
+		repo, ok := child.Operations().(*Repository)
+		if !ok {
+			continue
+		}
+		if repo.Repo.IsCloned() {
+			continue
+		}
+		repos = append(repos, repo)
+	}
+
+	if len(repos) == 0 {
+		u.Logger.Debug("user.prefetch: nothing to warm (all cloned / empty)",
+			"user", u.Login, "total", len(names))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), userPrefetchTimeout)
+	defer cancel()
+
+	written, err := u.batchRepoRootContents(ctx, repos)
+	if err != nil {
+		// Transport-level failure on at least one chunk — log and
+		// fall back to the per-repo REST fan-out. Any chunks that
+		// DID succeed already wrote their caches, so the fallback
+		// only incurs REST calls for the remaining (un-warmed) repos.
+		u.Logger.Warn("user.prefetch: graphql batch failed, falling back to REST",
+			"user", u.Login,
+			"warmed_before_fallback", written,
+			"total", len(repos),
+			"error", err)
+		u.prefetchRepoContentsREST(ctx, repos)
+	}
+
+	u.Logger.Debug("user.prefetch: done",
+		"user", u.Login,
+		"warmed", written,
+		"total", len(names),
+		"candidates", len(repos),
+		"strategy", "graphql",
+		"elapsed", time.Since(started).Round(time.Millisecond))
+}
+
+// prefetchRepoContentsREST is the legacy per-repo concurrent REST path,
+// used only as a fallback when the GraphQL batch call fails. Matches
+// the historical concurrency cap (userPrefetchConcurrency) and relies
+// on cachedRootContents's mutex to singleflight per-inode. Skips repos
+// whose cache was already populated by a partial GraphQL success.
+func (u *User) prefetchRepoContentsREST(ctx context.Context, repos []*Repository) {
+	sem := make(chan struct{}, userPrefetchConcurrency)
+	var wg sync.WaitGroup
+	for _, r := range repos {
+		// Cheap check: if a prior partial GraphQL success already
+		// wrote this inode's cache, skip the REST round trip.
+		r.apiMu.Lock()
+		fresh := !r.apiRootCachedAt.IsZero() && time.Since(r.apiRootCachedAt) < repositoryAPITTL
+		r.apiMu.Unlock()
+		if fresh {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r *Repository) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// Errors intentionally ignored — on-demand Readdir retries.
+			_, _ = r.cachedRootContents(ctx)
+		}(r)
+	}
+	wg.Wait()
 }
 
 // buildEntries converts the cached name slice into FUSE dirents and
@@ -512,7 +686,10 @@ func (u *User) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	if isBlockedTopLevel(name) {
 		return nil, syscall.ENOENT
 	}
-	out.SetEntryTimeout(entryTimeout)
+	// Intentionally no out.SetEntryTimeout here — see FS.Lookup doc
+	// comment. Negative returns must leave EntryTimeout at 0 so the
+	// bridge applies NegativeTimeout (30min kernel dcache); positive
+	// returns get EntryTimeout from mount options automatically.
 
 	if existing := u.GetChild(name); existing != nil {
 		return existing, 0
@@ -557,6 +734,94 @@ type Repository struct {
 	Repo   *reposrc.Repo
 	Client *github.Client // for the pre-clone Contents-API listing path
 	Logger *slog.Logger
+
+	// apiMu guards apiRootItems + apiRootErrno + apiRootCachedAt +
+	// apiRootInflight — per-inode cache of the root Contents-API
+	// listing. eza --icons opens every sibling repo to pick
+	// project-type icons; without this each such probe is an HTTP
+	// round trip. Callers for different inodes proceed in parallel,
+	// which is what lets User.prefetchRepoContents warm N repos
+	// concurrently.
+	//
+	// apiRootErrno captures the last outcome so we can negative-cache
+	// ENOENT (empty repo — GitHub's /contents/ returns 404 for repos
+	// with no commits). Transient failures (EIO) are deliberately NOT
+	// cached; apiRootCachedAt.IsZero() means "no result recorded".
+	//
+	// Concurrency discipline: apiMu is only ever held across short
+	// critical sections (cache read/write) — never across a network
+	// call. Concurrent callers for the same inode singleflight via
+	// apiRootInflight: the first miss creates the channel, drops
+	// apiMu, fires the network call, then re-acquires apiMu to
+	// store + close the channel. Subsequent callers observe the
+	// channel, drop apiMu, and wait on it, then re-acquire apiMu to
+	// read the cached result.
+	apiMu           sync.Mutex
+	apiRootItems    []*github.RepositoryContent
+	apiRootErrno    syscall.Errno
+	apiRootCachedAt time.Time
+	apiRootInflight chan struct{} // non-nil while a contentsAt call is in flight; closed on completion
+}
+
+// cachedRootContents returns the root Contents listing for this
+// repo, serving from the per-inode cache when fresh. Concurrent
+// callers singleflight via apiRootInflight: only one contentsAt
+// call runs; the rest wait and read the shared result. apiMu is
+// never held across the network call, so Getattr's pushedAt
+// snapshot (and any other short apiMu-critical section) never
+// blocks on a slow /contents/ fetch.
+//
+// Caches BOTH successful results and ENOENT — an empty repo's 404
+// is a stable answer (user has to push a first commit for it to
+// change), so re-probing it every `ls` wastes ~110ms per empty repo
+// serialised by the kernel's opendir walk. EIO is not cached: the
+// caller can retry without hammering a broken cache entry.
+//
+// Subdir (path != "") fetches bypass this and go straight to
+// contentsAt — they're rare (only hit when the shell descends into
+// an uncloned repo without triggering a full clone) and the root
+// listing is what eza/lsd hammer.
+func (r *Repository) cachedRootContents(ctx context.Context) ([]*github.RepositoryContent, syscall.Errno) {
+	for {
+		r.apiMu.Lock()
+		if !r.apiRootCachedAt.IsZero() && time.Since(r.apiRootCachedAt) < repositoryAPITTL {
+			items, errno := r.apiRootItems, r.apiRootErrno
+			r.apiMu.Unlock()
+			return items, errno
+		}
+		// A sibling call is in flight — drop apiMu and wait for it,
+		// then loop to re-check the cache. Respects ctx so a client
+		// disconnect doesn't hang us on a slow leader.
+		if inflight := r.apiRootInflight; inflight != nil {
+			r.apiMu.Unlock()
+			select {
+			case <-inflight:
+				continue
+			case <-ctx.Done():
+				return nil, syscall.EINTR
+			}
+		}
+		// Claim leadership: install the inflight channel, then
+		// release apiMu before the network call.
+		done := make(chan struct{})
+		r.apiRootInflight = done
+		r.apiMu.Unlock()
+
+		items, errno := r.contentsAt(ctx, "")
+
+		r.apiMu.Lock()
+		// Only record stable outcomes. EIO means transient (network,
+		// 5xx) and should retry on the next call.
+		if errno == 0 || errno == syscall.ENOENT {
+			r.apiRootItems = items
+			r.apiRootErrno = errno
+			r.apiRootCachedAt = time.Now()
+		}
+		r.apiRootInflight = nil
+		close(done)
+		r.apiMu.Unlock()
+		return items, errno
+	}
 }
 
 var _ = (fs.NodeGetattrer)((*Repository)(nil))
@@ -607,7 +872,8 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	if blockedInRepo[name] {
 		return nil, syscall.ENOENT
 	}
-	out.SetEntryTimeout(entryTimeout)
+	// See FS.Lookup: no pre-set EntryTimeout so the bridge can
+	// negative-cache ENOENT returns (e.g. from r.tree() or lookupViaAPI).
 	if existing := r.GetChild(name); existing != nil {
 		return existing, 0
 	}
@@ -627,7 +893,7 @@ func (r *Repository) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 // to non-executable until the clone lands; we rebuild those details
 // tree-accurately on the first real traversal.
 func (r *Repository) readdirViaAPI(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	items, errno := r.contentsAt(ctx, "")
+	items, errno := r.cachedRootContents(ctx)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -655,8 +921,8 @@ func (r *Repository) readdirViaAPI(ctx context.Context) (fs.DirStream, syscall.E
 func (r *Repository) lookupViaAPI(ctx context.Context, name string) (*fs.Inode, syscall.Errno) {
 	// Fetch the full root listing (not just `name`) so we can pre-populate
 	// siblings — cheap insurance against the shell following up with
-	// lookups for neighbours.
-	items, errno := r.contentsAt(ctx, "")
+	// lookups for neighbours. Shares the per-inode cache with readdirViaAPI.
+	items, errno := r.cachedRootContents(ctx)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -817,7 +1083,8 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	if blockedInRepo[name] {
 		return nil, syscall.ENOENT
 	}
-	out.SetEntryTimeout(entryTimeout)
+	// See FS.Lookup: no pre-set EntryTimeout so ENOENT returns from
+	// lookupAt (tree miss) get absorbed by the kernel negative cache.
 	if existing := d.GetChild(name); existing != nil {
 		return existing, 0
 	}
