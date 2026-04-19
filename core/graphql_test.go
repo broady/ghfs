@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-github/v60/github"
+	"github.com/google/go-github/v77/github"
 )
 
 // TestBuildRepoMetadataQuery_AliasesAndEscaping checks that every repo
