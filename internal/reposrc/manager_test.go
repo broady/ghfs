@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -223,6 +225,260 @@ func TestEnsureCloned_FailureCached(t *testing.T) {
 type errTest string
 
 func (e errTest) Error() string { return string(e) }
+
+// TestFanOutRepos_RespectsConcurrency pins the invariant that at most
+// `concurrency` workers are in flight at any moment. Regression guard
+// against reverting to the v0 serial loop (which took multi-minute
+// total walk on users with many clones) or, conversely, removing the
+// bound entirely and spawning N parallel git fetches.
+//
+// The synthetic fn increments an atomic counter on entry, records the
+// running peak, blocks on a barrier until every expected-parallel
+// worker has queued, then decrements on exit. If concurrency isn't
+// respected the barrier would let more than `concurrency` workers past
+// and the peak assertion would fire.
+func TestFanOutRepos_RespectsConcurrency(t *testing.T) {
+	t.Parallel()
+
+	const total = 16
+	const concurrency = 4
+
+	repos := make([]*Repo, total)
+	for i := range repos {
+		repos[i] = &Repo{}
+	}
+
+	var (
+		running atomic.Int32
+		peak    atomic.Int32
+	)
+	// release unblocks workers one "batch" at a time so the peak check
+	// is deterministic: every first-batch worker must enter before any
+	// of them can exit. Buffer is `concurrency` so a full batch parks
+	// on the send / recv without needing a goroutine per release token.
+	release := make(chan struct{}, concurrency)
+
+	var seen sync.Map // *Repo -> struct{}, verifies every repo processed
+
+	fn := func(ctx context.Context, r *Repo) {
+		seen.Store(r, struct{}{})
+		cur := running.Add(1)
+		for {
+			prev := peak.Load()
+			if cur <= prev || peak.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		<-release
+		running.Add(-1)
+	}
+
+	// Feed release tokens in bursts of `concurrency` so fanOutRepos
+	// must serialise work into ceil(total/concurrency) waves.
+	done := make(chan struct{})
+	go func() {
+		fanOutRepos(context.Background(), repos, concurrency, fn)
+		close(done)
+	}()
+
+	for released := 0; released < total; {
+		batch := concurrency
+		if remaining := total - released; remaining < batch {
+			batch = remaining
+		}
+		// Give queued workers a beat to enter fn before topping up
+		// the release channel — otherwise the bound-check window is
+		// shorter than the scheduler can reliably hit.
+		time.Sleep(5 * time.Millisecond)
+		for i := 0; i < batch; i++ {
+			release <- struct{}{}
+			released++
+		}
+	}
+	<-done
+
+	if got := peak.Load(); got > concurrency {
+		t.Errorf("peak concurrency = %d, want <= %d (semaphore is leaking)", got, concurrency)
+	}
+	if got := peak.Load(); got < concurrency {
+		t.Errorf("peak concurrency = %d, want %d (under-utilising workers — the fan-out isn't actually parallel)", got, concurrency)
+	}
+	if got := running.Load(); got != 0 {
+		t.Errorf("running = %d after wg.Wait, want 0", got)
+	}
+	var count int
+	seen.Range(func(k, _ any) bool { count++; return true })
+	if count != total {
+		t.Errorf("processed %d repos, want %d — some workers never ran", count, total)
+	}
+}
+
+// TestFanOutRepos_ContextCancelSkipsPending verifies that when ctx is
+// cancelled mid-flight, workers that haven't yet acquired the semaphore
+// exit without running fn. Already-running workers still see the
+// cancelled ctx and are expected to honour it themselves — that part
+// is fn's responsibility, not fanOutRepos's.
+func TestFanOutRepos_ContextCancelSkipsPending(t *testing.T) {
+	t.Parallel()
+
+	const total = 8
+	const concurrency = 2
+
+	repos := make([]*Repo, total)
+	for i := range repos {
+		repos[i] = &Repo{}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{}, total)
+	blocked := make(chan struct{})
+
+	var ran atomic.Int32
+	fn := func(ctx context.Context, r *Repo) {
+		ran.Add(1)
+		started <- struct{}{}
+		<-blocked
+	}
+
+	done := make(chan struct{})
+	go func() {
+		fanOutRepos(ctx, repos, concurrency, fn)
+		close(done)
+	}()
+
+	// Wait for the first wave of `concurrency` workers to enter fn, then
+	// cancel. Pending workers haven't acquired the sem (the running
+	// ones still hold it) and should exit on ctx.Done rather than run
+	// fn. We must give them a scheduling window to observe ctx.Done
+	// *before* releasing the sem — otherwise both select cases become
+	// ready simultaneously once workers 1..concurrency exit, and Go's
+	// random-among-ready semantics would let waiters sneak through.
+	for i := 0; i < concurrency; i++ {
+		<-started
+	}
+	cancel()
+	// sem is still full (running workers haven't exited) — waiters'
+	// only ready select case is ctx.Done. 50ms is far more than any
+	// plausible scheduler delay for n goroutines waking on a channel.
+	time.Sleep(50 * time.Millisecond)
+	ranAtCancel := ran.Load()
+	close(blocked)
+	<-done
+
+	// Exactly `concurrency` workers should have run fn by the time we
+	// cancel — the rest are blocked on the full semaphore and saw
+	// ctx cancelled first.
+	if got, want := ranAtCancel, int32(concurrency); got != want {
+		t.Errorf("ran at cancel = %d, want %d (ctx cancel should prevent further workers from entering fn)", got, want)
+	}
+	// Final count: anything beyond `concurrency` means workers that
+	// should have exited on ctx.Done instead raced through the sem
+	// select after sem cleared.
+	if got, want := ran.Load(), int32(concurrency); got != want {
+		t.Errorf("final ran = %d, want %d (workers raced past ctx cancel)", got, want)
+	}
+}
+
+// TestFanOutRepos_SaneDefaults covers the guards on the boundary inputs:
+// zero repos is a no-op, and concurrency <= 0 gets bumped to 1 rather
+// than deadlocking on a zero-capacity semaphore.
+func TestFanOutRepos_SaneDefaults(t *testing.T) {
+	t.Parallel()
+
+	// Empty input: fn must not be called, function returns promptly.
+	called := false
+	fanOutRepos(context.Background(), nil, 4, func(context.Context, *Repo) { called = true })
+	if called {
+		t.Error("fn called on empty repo list")
+	}
+
+	// Zero concurrency: must still make forward progress (treated as 1).
+	repos := []*Repo{{}, {}, {}}
+	var count atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		fanOutRepos(context.Background(), repos, 0, func(context.Context, *Repo) {
+			count.Add(1)
+		})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrency=0 deadlocked fanOutRepos (zero-capacity semaphore?)")
+	}
+	if count.Load() != int32(len(repos)) {
+		t.Errorf("ran %d workers, want %d", count.Load(), len(repos))
+	}
+}
+
+// TestManagerFetchAll_EndToEnd wires real local bare repos through
+// FetchAll and verifies (a) every cloned repo's tree cache is
+// invalidated (the observable side-effect of Repo.Fetch), and
+// (b) repos that were never cloned are left alone — Fetch on them
+// is a no-op so FetchAll must not blow up on them.
+func TestManagerFetchAll_EndToEnd(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+
+	// Local source repo used as the clone remote. Plain directory is
+	// enough because git clone understands local paths.
+	source := filepath.Join(tmp, "src")
+	run(t, "git", "init", "-q", source)
+	mustWrite(t, filepath.Join(source, "f.txt"), []byte("x"))
+	run(t, "git", "-C", source, "add", "-A")
+	run(t, "git", "-C", source, "-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "init")
+
+	blobs, err := blobcache.New(filepath.Join(tmp, "blobs"), 1<<20, nil)
+	if err != nil {
+		t.Fatalf("blobcache.New: %v", err)
+	}
+	store := gitstore.New(nil)
+	m := NewManager(store, blobs, filepath.Join(tmp, "repos"), "", nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Clone three repos. Each shares the same source — all we care about
+	// is that Fetch succeeds and the tree map gets cleared.
+	cloned := make([]*Repo, 3)
+	for i := range cloned {
+		r := m.Get("owner", "repo"+string(rune('a'+i)))
+		r.Config.RemoteURL = source
+		if err := r.EnsureCloned(ctx); err != nil {
+			t.Fatalf("EnsureCloned[%d]: %v", i, err)
+		}
+		// Pre-populate a fake tree entry so we can observe FetchAll
+		// clearing it. Fetch's contract is "invalidate the tree cache
+		// so the next ResolveTree re-reads post-fetch state"; a stale
+		// entry here proves the clear actually ran.
+		r.mu.Lock()
+		r.trees["sentinel"] = &Tree{RefName: "sentinel"}
+		r.mu.Unlock()
+		cloned[i] = r
+	}
+	// An uncloned repo: Fetch is a documented no-op. FetchAll must not
+	// include it (ListClones filters uncloned) and must not crash.
+	uncloned := m.Get("owner", "never-cloned")
+	uncloned.Config.RemoteURL = source
+
+	m.FetchAll(ctx, 2, 20*time.Second)
+
+	for i, r := range cloned {
+		r.mu.Lock()
+		_, stale := r.trees["sentinel"]
+		r.mu.Unlock()
+		if stale {
+			t.Errorf("cloned[%d]: tree cache not cleared — Fetch did not run through FetchAll", i)
+		}
+	}
+	uncloned.mu.Lock()
+	cloned2 := uncloned.cloned
+	uncloned.mu.Unlock()
+	if cloned2 {
+		t.Error("uncloned repo got cloned by FetchAll (should be a strict refresh, never a clone)")
+	}
+}
 
 // TestRepoBlobSize covers the oid->size backfill used by the FUSE
 // layer when a blobless clone left tree entries at SizeState="unknown".

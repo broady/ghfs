@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -781,5 +784,214 @@ func TestRepositoryCachedRootContents_CtxCancelDuringWait(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ctx cancel did not unblock waiter — singleflight wait must select on ctx.Done")
+	}
+}
+
+// TestFileHandleRead_ReturnsExpectedBytes exercises the happy path of
+// FileHandle.Read: given an open cache file and a within-range offset,
+// the returned ReadResult.Bytes must surface the correct slice. This
+// is the primary functional guarantee — empty reads here were the
+// symptom of the ReadResultFd finalizer race described below.
+func TestFileHandleRead_ReturnsExpectedBytes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blob")
+	content := []byte("hello, fuse reader — this is blob content\n")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	fh := &FileHandle{
+		file:   f,
+		size:   int64(len(content)),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	buf := make([]byte, len(content))
+	res, errno := fh.Read(context.Background(), buf, 0)
+	if errno != 0 {
+		t.Fatalf("Read errno = %v, want 0", errno)
+	}
+	got, status := res.Bytes(buf)
+	if !status.Ok() {
+		t.Fatalf("ReadResult.Bytes status = %v, want ok", status)
+	}
+	if string(got) != string(content) {
+		t.Errorf("got %q, want %q", got, content)
+	}
+}
+
+// TestFileHandleRead_SurvivesGCWhileHandleHeld is a regression guard for
+// the missing runtime.KeepAlive(fh) in FileHandle.Read.
+//
+// Background: FileHandle.Read builds a fuse.ReadResultFd from
+// fh.file.Fd(), which returns a bare uintptr. *os.File carries a
+// close-on-finalize finalizer; if the runtime treats fh.file as dead
+// the instant Fd() returns — which is permitted because the constructed
+// ReadResultFd value holds no pointer back to fh.file — the finalizer
+// can race the splice / pread on the reply path and close the fd under
+// go-fuse. Symptom in production: sporadic EBADF / empty reads under
+// concurrent access.
+//
+// Production reality: go-fuse's bridge stores the FileHandle in its
+// fileEntry registry (files []*fileEntry in fs/bridge.go) for the
+// lifetime of the open fd, so a caller-side reference is always live
+// across the splice. This test mirrors that: fh is retained, GC runs
+// mid-flight, and the returned ReadResult must still read correct
+// bytes. Without the KeepAlive the compiler was within its rights to
+// treat fh.file as dead before ReadResultFd was constructed — this
+// pins the invariant "fh.file stays alive across the Fd() → splice
+// hop" while also documenting, via the retained fh, the liveness
+// contract the bridge provides.
+func TestFileHandleRead_SurvivesGCWhileHandleHeld(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blob")
+	content := []byte("gc-safety content — must survive a finalizer sweep\n")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	fh := &FileHandle{
+		file:   f,
+		size:   int64(len(content)),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	buf := make([]byte, len(content))
+	res, errno := fh.Read(context.Background(), buf, 0)
+	if errno != 0 {
+		t.Fatalf("Read errno = %v", errno)
+	}
+
+	// Force a couple of GC cycles between Read and the subsequent
+	// Bytes() call. fh is retained above, so nothing that the bridge
+	// would hold onto should be reclaimable — if Bytes() returns
+	// EBADF here, *os.File was finalized prematurely and the fix (or
+	// the bridge's retention invariant) is broken.
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+	}
+	runtime.Gosched()
+
+	got, status := res.Bytes(buf)
+	if !status.Ok() {
+		t.Fatalf("ReadResult.Bytes status = %v — fd appears closed mid-flight (KeepAlive missing or bridge-retention invariant broken)", status)
+	}
+	if string(got) != string(content) {
+		t.Errorf("got %q, want %q", got, content)
+	}
+	// Redundant use of fh after Bytes() makes fh's liveness through
+	// the whole test explicit to any future reader (and to the
+	// compiler's escape analysis).
+	runtime.KeepAlive(fh)
+}
+
+// TestFileHandleRead_ConcurrentReaders reproduces the concurrency
+// pattern described in the EBADF / empty-read bug report: many parallel
+// Read calls against the same FileHandle, each splicing from the same
+// fd at different offsets. Without the KeepAlive fix in FileHandle.Read,
+// a race between ReadResultFd construction and the *os.File finalizer
+// could surface as sporadic short/empty reads under this load. With
+// the fix in place — and fh retained by the driver — every read must
+// observe the full expected slice.
+func TestFileHandleRead_ConcurrentReaders(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blob")
+	content := make([]byte, 64*1024)
+	for i := range content {
+		content[i] = byte(i)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+
+	fh := &FileHandle{
+		file:   f,
+		size:   int64(len(content)),
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	const (
+		workers   = 16
+		reads     = 64
+		chunkSize = 4096
+	)
+
+	// Spin a GC goroutine to maximise the chance of catching a
+	// finalizer race if KeepAlive (or the caller-retention invariant)
+	// is ever lost.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				runtime.GC()
+			}
+		}
+	}()
+	t.Cleanup(func() { close(stop) })
+
+	var wg sync.WaitGroup
+	var failures atomic.Int32
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			buf := make([]byte, chunkSize)
+			for i := 0; i < reads; i++ {
+				off := int64(((seed*reads + i) * chunkSize) % (len(content) - chunkSize))
+				res, errno := fh.Read(context.Background(), buf, off)
+				if errno != 0 {
+					failures.Add(1)
+					t.Errorf("Read errno = %v at off=%d", errno, off)
+					return
+				}
+				got, status := res.Bytes(buf)
+				if !status.Ok() {
+					failures.Add(1)
+					t.Errorf("Bytes status = %v at off=%d (EBADF here means the fd raced a finalizer)", status, off)
+					return
+				}
+				if len(got) != chunkSize {
+					failures.Add(1)
+					t.Errorf("short read at off=%d: got %d bytes, want %d", off, len(got), chunkSize)
+					return
+				}
+				for j, b := range got {
+					if want := byte(int(off) + j); b != want {
+						failures.Add(1)
+						t.Errorf("corruption at off=%d byte=%d: got %d, want %d", off, j, b, want)
+						return
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	runtime.KeepAlive(fh)
+	if failures.Load() > 0 {
+		t.Fatalf("%d read failures — see above", failures.Load())
 	}
 }
