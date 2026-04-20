@@ -73,36 +73,57 @@ Or use the GitHub CLI to automatically provide your token:
 $ ghfs -token $(gh auth token) ~/github.com
 ```
 
-#### Caching
-
-GHFS uses a two-tier cache by default: an in-memory LRU cache backed by a disk cache. This allows fast repeated access while persisting responses across sessions.
-
-Configure caching with the following flags:
+The token can also be passed via the `GITHUB_TOKEN` environment variable, which keeps it out of `ps` / cmdline. ghfs reads it at startup and unsets it immediately so spawned children (e.g. `git cat-file`) don't inherit it. Handy for systemd units:
 
 ```sh
-# Default: 128 MB memory, 1 GB disk cache at ~/.cache/ghfs
+$ GITHUB_TOKEN=$(gh auth token) ghfs ~/github.com
+```
+
+Pass `-anonymous` to skip authentication entirely (the public GitHub API allows 60 requests/hour).
+
+#### Caching
+
+GHFS keeps three kinds of local state under `-cache-dir` (default `~/.cache/ghfs`):
+
+1. **Blob cache** — hydrated git blob contents, content-addressed under `<cache-dir>/blobs`. Sized by `-cache-disk-mb` (default 1024 MB); oldest-first eviction when over budget.
+2. **API response cache** — cached GitHub REST responses (org/user repo listings, Contents API results). Two-tier: in-memory LRU sized by `-api-cache-mem-mb` (default 128 MB), backed by disk at `<cache-dir>/api` (disk portion has no size cap). Revalidated with ETags via [`httpcache`](https://github.com/gregjones/httpcache).
+3. **Blobless repo clones** — `git clone --filter=blob:none` checkouts under `<cache-dir>/repos`, one per repo you touch. Not size-bounded; delete a subdirectory to reclaim space (it will re-clone on next access).
+
+Examples:
+
+```sh
+# Defaults: 1 GB blob cache, 128 MB API-response memory cache, ~/.cache/ghfs
 $ ghfs ~/github.com
 
-# Larger memory cache (500 MB) and disk cache (5 GB)
-$ ghfs -cache-mem-mb=500 -cache-disk-mb=5120 ~/github.com
+# Larger blob cache (5 GB) and API-response memory cache (500 MB)
+$ ghfs -cache-disk-mb=5120 -api-cache-mem-mb=500 ~/github.com
 
-# Custom cache directory
+# Custom cache root
 $ ghfs -cache-dir=/tmp/my-cache ~/github.com
 
-# Disable caching entirely
-$ ghfs -no-cache ~/github.com
+# Disable the API response cache (always hit the network for metadata;
+# blob cache and repo clones are unaffected)
+$ ghfs -no-api-cache ~/github.com
 ```
 
 **Force cache refresh:**
 
-To force immediate revalidation with GitHub (for example, to see recent changes), send SIGUSR1 to the ghfs process:
+The API response cache fronts a 5-minute revalidation-suppression window so shell prompts and eza-style icon probes don't hit GitHub on every render. To force immediate revalidation and pull updates for every cloned repo, send SIGUSR1:
 
 ```sh
 # The command is shown in the startup logs, or find the PID:
 $ kill -USR1 $(pgrep ghfs)
 ```
 
-This clears the revalidation suppression cache. The next filesystem operation will check GitHub for updates, even if the cached data hasn't expired yet.
+This clears the suppression window (so the next API request revalidates via ETag) and runs `git fetch` on every cloned repo. It does **not** invalidate kernel FUSE dcache entries, which expire naturally after 30 minutes.
+
+#### Other flags
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `-anonymous` | off | Skip authentication. Unauthenticated GitHub API allows 60 req/hour. |
+| `-cat-file-pool=N` | 4 | Max persistent `git cat-file --batch` processes per repo. |
+| `-hydrate-workers=N` | 4 | Blob hydration worker goroutines per repo. |
 
 #### Logging
 
