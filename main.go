@@ -13,7 +13,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log"
 	"log/slog"
 	"os"
@@ -23,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/google/go-github/v77/github"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -34,19 +34,26 @@ import (
 	"github.com/broady/ghfs/internal/reposrc"
 )
 
-var (
-	token       = flag.String("token", "", "personal access token")
-	anonymous   = flag.Bool("anonymous", false, "use anonymous (unauthenticated) API requests")
-	cacheDir    = flag.String("cache-dir", "", "directory for disk cache (default: ~/.cache/ghfs)")
-	diskCacheMB = flag.Int("cache-disk-mb", 1024, "shared blob cache size budget in MB")
-	batchPoolSz = flag.Int("cat-file-pool", 4, "max persistent `git cat-file --batch` processes per repo")
-	hydWorkers  = flag.Int("hydrate-workers", 4, "blob hydration worker goroutines per repo")
-	apiMemMB    = flag.Int("api-cache-mem-mb", githubhttp.DefaultMemCacheMB, "in-memory budget (MB) for the GitHub API response cache")
-	apiNoCache  = flag.Bool("no-api-cache", false, "disable the GitHub API response cache (always hits the network)")
-)
+// CLI describes the ghfs command-line surface. Flag names are preserved
+// from the previous stdlib-flag implementation (kebab-case), but kong
+// follows POSIX conventions: long flags must be prefixed with `--`.
+type CLI struct {
+	Token       string `help:"Personal access token." env:"GITHUB_TOKEN"`
+	Anonymous   bool   `help:"Use anonymous (unauthenticated) API requests."`
+	CacheDir    string `name:"cache-dir" help:"Directory for disk cache (default: ~/.cache/ghfs)." placeholder:"DIR"`
+	CacheDiskMB int    `name:"cache-disk-mb" help:"Shared blob cache size budget in MB." default:"1024"`
+	CatFilePool int    `name:"cat-file-pool" help:"Max persistent 'git cat-file --batch' processes per repo." default:"4"`
+	HydrateWorkers int `name:"hydrate-workers" help:"Blob hydration worker goroutines per repo." default:"4"`
+	APICacheMemMB  int `name:"api-cache-mem-mb" help:"In-memory budget (MB) for the GitHub API response cache." default:"${default_api_cache_mem_mb}"`
+	NoAPICache     bool `name:"no-api-cache" help:"Disable the GitHub API response cache (always hits the network)."`
+
+	Path string `arg:"" help:"Mount point for the FUSE filesystem."`
+}
 
 func main() {
-	// Logger setup.
+	// Logger setup (must run before kong.Parse so --help + parse errors
+	// go through slog if we ever wire them in; currently kong writes
+	// directly to stderr, which is fine).
 	logLevelStr := os.Getenv("GHFS_LOG_LEVEL")
 	if logLevelStr == "" {
 		logLevelStr = "info"
@@ -60,31 +67,33 @@ func main() {
 	slog.SetDefault(slog.New(handler))
 	log.SetFlags(0)
 
-	flag.Parse()
-	if flag.NArg() != 1 {
-		log.Fatal("path required")
+	var cli CLI
+	kctx := kong.Parse(&cli,
+		kong.Name("ghfs"),
+		kong.Description("Mount GitHub as a FUSE filesystem."),
+		kong.UsageOnError(),
+		kong.Vars{
+			"default_api_cache_mem_mb": strconv.Itoa(githubhttp.DefaultMemCacheMB),
+		},
+	)
+
+	// Always unset GITHUB_TOKEN so spawned child processes (e.g.
+	// `git cat-file`) don't inherit it. Safe whether kong populated
+	// Token from env or not.
+	os.Unsetenv("GITHUB_TOKEN")
+
+	if cli.Token == "" && !cli.Anonymous {
+		kctx.Fatalf("must provide either --token or --anonymous")
 	}
-	// Fall back to $GITHUB_TOKEN so callers (e.g. systemd units) can pass the
-	// token via env instead of an argv flag, keeping it out of `ps` / cmdline.
-	// Unset immediately so spawned child processes don't inherit it.
-	if *token == "" {
-		if env := os.Getenv("GITHUB_TOKEN"); env != "" {
-			*token = env
-			os.Unsetenv("GITHUB_TOKEN")
-		}
-	}
-	if *token == "" && !*anonymous {
-		log.Fatal("must provide either -token or -anonymous flag")
-	}
-	if *token != "" && *anonymous {
-		log.Fatal("cannot specify both -token and -anonymous")
+	if cli.Token != "" && cli.Anonymous {
+		kctx.Fatalf("cannot specify both --token and --anonymous")
 	}
 
-	mountPath := flag.Arg(0)
+	mountPath := cli.Path
 	slog.Info("starting ghfs", "mount_path", mountPath)
 
 	// Resolve cache directory.
-	cachePath := *cacheDir
+	cachePath := cli.CacheDir
 	if cachePath == "" {
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
@@ -100,17 +109,17 @@ func main() {
 	apiCacheDir := filepath.Join(cachePath, "api")
 
 	// Blob cache + gitstore + repo manager.
-	cache, err := blobcache.New(blobsDir, int64(*diskCacheMB)*1024*1024, slog.Default())
+	cache, err := blobcache.New(blobsDir, int64(cli.CacheDiskMB)*1024*1024, slog.Default())
 	if err != nil {
 		log.Fatal("blob cache init:", err)
 	}
 	store := gitstore.New(slog.Default())
-	store.SetBatchPoolSize(*batchPoolSz)
-	repos := reposrc.NewManager(store, cache, reposDir, *token, slog.Default())
-	repos.HydratorWorkers = *hydWorkers
+	store.SetBatchPoolSize(cli.CatFilePool)
+	repos := reposrc.NewManager(store, cache, reposDir, cli.Token, slog.Default())
+	repos.HydratorWorkers = cli.HydrateWorkers
 
 	slog.Info("cache configured",
-		"disk_mb", *diskCacheMB,
+		"disk_mb", cli.CacheDiskMB,
 		"blobs_dir", blobsDir,
 		"repos_dir", reposDir,
 	)
@@ -120,27 +129,27 @@ func main() {
 	// probes (e.g. by eza --icons) cost zero network after warming.
 	// SIGUSR1 flushes the suppressor so the next request revalidates.
 	apiClient, err := githubhttp.New(githubhttp.Config{
-		Token:      *token,
+		Token:      cli.Token,
 		CacheDir:   apiCacheDir,
-		MemCacheMB: *apiMemMB,
-		Disabled:   *apiNoCache,
+		MemCacheMB: cli.APICacheMemMB,
+		Disabled:   cli.NoAPICache,
 		Logger:     slog.Default(),
 	})
 	if err != nil {
 		log.Fatal("github http client init:", err)
 	}
-	if *apiNoCache {
+	if cli.NoAPICache {
 		slog.Info("GitHub API cache disabled")
 	} else {
 		slog.Info("GitHub API cache configured",
-			"mem_mb", *apiMemMB,
+			"mem_mb", cli.APICacheMemMB,
 			"dir", apiCacheDir,
 			"suppress_window", githubhttp.DefaultSuppressDur,
 		)
 	}
 	githubClient := github.NewClient(apiClient.HTTP)
 
-	if *token == "" {
+	if cli.Token == "" {
 		slog.Warn("using anonymous mode - REST API rate limits apply (60 requests/hour)")
 	}
 
@@ -162,7 +171,7 @@ func main() {
 	// Workers match the hydrate / cat-file pool defaults (4) — enough
 	// parallelism to saturate a typical network pipe without spawning
 	// a thundering herd of git processes.
-	refreshWorkers := *hydWorkers
+	refreshWorkers := cli.HydrateWorkers
 	if refreshWorkers < 1 {
 		refreshWorkers = 4
 	}

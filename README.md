@@ -16,7 +16,7 @@ To run ghfs:
 
 ```sh
 $ go install github.com/broady/ghfs@latest
-$ ghfs -h
+$ ghfs --help
 ```
 
 Or run without installing (npx/uvx-equivalent):
@@ -64,13 +64,13 @@ The MIT License (MIT)
 To authenticate with GitHub and increase API rate limits, pass your personal access token:
 
 ```sh
-$ ghfs -token=YOUR_TOKEN ~/github.com
+$ ghfs --token=YOUR_TOKEN ~/github.com
 ```
 
 Or use the GitHub CLI to automatically provide your token:
 
 ```sh
-$ ghfs -token $(gh auth token) ~/github.com
+$ ghfs --token $(gh auth token) ~/github.com
 ```
 
 The token can also be passed via the `GITHUB_TOKEN` environment variable, which keeps it out of `ps` / cmdline. ghfs reads it at startup and unsets it immediately so spawned children (e.g. `git cat-file`) don't inherit it. Handy for systemd units:
@@ -79,14 +79,14 @@ The token can also be passed via the `GITHUB_TOKEN` environment variable, which 
 $ GITHUB_TOKEN=$(gh auth token) ghfs ~/github.com
 ```
 
-Pass `-anonymous` to skip authentication entirely (the public GitHub API allows 60 requests/hour).
+Pass `--anonymous` to skip authentication entirely (the public GitHub API allows 60 requests/hour).
 
 #### Caching
 
-GHFS keeps three kinds of local state under `-cache-dir` (default `~/.cache/ghfs`):
+GHFS keeps three kinds of local state under `--cache-dir` (default `~/.cache/ghfs`):
 
-1. **Blob cache** — hydrated git blob contents, content-addressed under `<cache-dir>/blobs`. Sized by `-cache-disk-mb` (default 1024 MB); oldest-first eviction when over budget.
-2. **API response cache** — cached GitHub REST responses (org/user repo listings, Contents API results). Two-tier: in-memory LRU sized by `-api-cache-mem-mb` (default 128 MB), backed by disk at `<cache-dir>/api` (disk portion has no size cap). Revalidated with ETags via [`httpcache`](https://github.com/gregjones/httpcache).
+1. **Blob cache** — hydrated git blob contents, content-addressed under `<cache-dir>/blobs`. Sized by `--cache-disk-mb` (default 1024 MB); oldest-first eviction when over budget.
+2. **API response cache** — cached GitHub REST responses (org/user repo listings, Contents API results). Two-tier: in-memory LRU sized by `--api-cache-mem-mb` (default 128 MB), backed by disk at `<cache-dir>/api` (disk portion has no size cap). Revalidated with ETags via [`httpcache`](https://github.com/gregjones/httpcache).
 3. **Blobless repo clones** — `git clone --filter=blob:none` checkouts under `<cache-dir>/repos`, one per repo you touch. Not size-bounded; delete a subdirectory to reclaim space (it will re-clone on next access).
 
 Examples:
@@ -96,14 +96,14 @@ Examples:
 $ ghfs ~/github.com
 
 # Larger blob cache (5 GB) and API-response memory cache (500 MB)
-$ ghfs -cache-disk-mb=5120 -api-cache-mem-mb=500 ~/github.com
+$ ghfs --cache-disk-mb=5120 --api-cache-mem-mb=500 ~/github.com
 
 # Custom cache root
-$ ghfs -cache-dir=/tmp/my-cache ~/github.com
+$ ghfs --cache-dir=/tmp/my-cache ~/github.com
 
 # Disable the API response cache (always hit the network for metadata;
 # blob cache and repo clones are unaffected)
-$ ghfs -no-api-cache ~/github.com
+$ ghfs --no-api-cache ~/github.com
 ```
 
 **Force cache refresh:**
@@ -121,9 +121,9 @@ This clears the suppression window (so the next API request revalidates via ETag
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `-anonymous` | off | Skip authentication. Unauthenticated GitHub API allows 60 req/hour. |
-| `-cat-file-pool=N` | 4 | Max persistent `git cat-file --batch` processes per repo. |
-| `-hydrate-workers=N` | 4 | Blob hydration worker goroutines per repo. |
+| `--anonymous` | off | Skip authentication. Unauthenticated GitHub API allows 60 req/hour. |
+| `--cat-file-pool=N` | 4 | Max persistent `git cat-file --batch` processes per repo. |
+| `--hydrate-workers=N` | 4 | Blob hydration worker goroutines per repo. |
 
 #### Logging
 
